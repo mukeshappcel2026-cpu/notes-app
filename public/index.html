@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Notes App</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+
+        .config-section {
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 20px;
+        }
+
+        .config-section h3 {
+            margin-bottom: 15px;
+            color: #333;
+        }
+
+        .input-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+
+        input[type="text"] {
+            flex: 1;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: border-color 0.3s;
+        }
+
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        button {
+            padding: 12px 24px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: 600;
+        }
+
+        button:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(102, 126, 234, 0.3);
+        }
+
+        button:active {
+            transform: translateY(0);
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+        }
+
+        .btn-secondary:hover {
+            background: #5a6268;
+        }
+
+        .btn-danger {
+            background: #dc3545;
+        }
+
+        .btn-danger:hover {
+            background: #c82333;
+        }
+
+        .btn-success {
+            background: #28a745;
+        }
+
+        .btn-success:hover {
+            background: #218838;
+        }
+
+        .btn-small {
+            padding: 8px 16px;
+            font-size: 0.9rem;
+        }
+
+        .new-note-section {
+            background: white;
+            padding: 25px;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 20px;
+        }
+
+        .new-note-section h3 {
+            margin-bottom: 15px;
+            color: #333;
+        }
+
+        textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1rem;
+            resize: vertical;
+            min-height: 100px;
+            font-family: inherit;
+            margin-bottom: 10px;
+            transition: border-color 0.3s;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .notes-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+        }
+
+        .note-card {
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+
+        .note-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 8px 15px rgba(0, 0, 0, 0.2);
+        }
+
+        .note-card h3 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 1.3rem;
+        }
+
+        .note-content {
+            color: #666;
+            margin-bottom: 15px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+
+        .note-meta {
+            font-size: 0.85rem;
+            color: #999;
+            margin-bottom: 15px;
+            border-top: 1px solid #f0f0f0;
+            padding-top: 10px;
+        }
+
+        .note-actions {
+            display: flex;
+            gap: 10px;
+        }
+
+        .edit-mode {
+            border: 2px solid #667eea;
+        }
+
+        .edit-mode textarea {
+            margin-bottom: 10px;
+        }
+
+        .status-message {
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            text-align: center;
+            font-weight: 500;
+        }
+
+        .status-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .status-error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .status-info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: white;
+            font-size: 1.2rem;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            background: white;
+            border-radius: 12px;
+            color: #666;
+        }
+
+        .empty-state h3 {
+            margin-bottom: 10px;
+            color: #333;
+        }
+
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 2rem;
+            }
+
+            .notes-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .input-group {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📝 Notes App</h1>
+            <p class="subtitle">Your personal cloud notebook</p>
+        </header>
+
+        <!-- Configuration Section -->
+        <div class="config-section">
+            <h3>⚙️ Configuration</h3>
+            <div class="input-group">
+                <input type="text" id="apiEndpoint" placeholder="API Endpoint (e.g., http://your-alb-url or https://api-gateway-url/prod)" value="">
+                <button onclick="saveConfig()">Save Config</button>
+            </div>
+            <div class="input-group">
+                <input type="text" id="userId" placeholder="Your User ID (e.g., user123)" value="user123">
+                <button class="btn-success" onclick="loadNotes()">Load Notes</button>
+            </div>
+        </div>
+
+        <div id="statusMessage"></div>
+
+        <!-- New Note Section -->
+        <div class="new-note-section">
+            <h3>✨ Create New Note</h3>
+            <input type="text" id="noteTitle" placeholder="Note Title" />
+            <textarea id="noteContent" placeholder="What's on your mind?"></textarea>
+            <button onclick="createNote()">Create Note</button>
+        </div>
+
+        <!-- Notes Grid -->
+        <div id="notesContainer">
+            <div class="loading">Loading notes...</div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        let API_ENDPOINT = '';
+        let currentUserId = 'user123';
+
+        // Load saved configuration
+        window.addEventListener('DOMContentLoaded', () => {
+            const savedEndpoint = localStorage.getItem('apiEndpoint');
+            const savedUserId = localStorage.getItem('userId');
+            
+            if (savedEndpoint) {
+                API_ENDPOINT = savedEndpoint;
+                document.getElementById('apiEndpoint').value = savedEndpoint;
+            }
+            
+            if (savedUserId) {
+                currentUserId = savedUserId;
+                document.getElementById('userId').value = savedUserId;
+            }
+
+            if (API_ENDPOINT) {
+                loadNotes();
+            } else {
+                showStatus('Please configure your API endpoint first', 'info');
+                document.getElementById('notesContainer').innerHTML = `
+                    <div class="empty-state">
+                        <h3>Welcome! 👋</h3>
+                        <p>Enter your API endpoint above to get started</p>
+                    </div>
+                `;
+            }
+        });
+
+        function saveConfig() {
+            const endpoint = document.getElementById('apiEndpoint').value.trim();
+            const userId = document.getElementById('userId').value.trim();
+            
+            if (!endpoint) {
+                showStatus('Please enter an API endpoint', 'error');
+                return;
+            }
+
+            // Remove trailing slash if present
+            API_ENDPOINT = endpoint.replace(/\/$/, '');
+            currentUserId = userId;
+            
+            localStorage.setItem('apiEndpoint', API_ENDPOINT);
+            localStorage.setItem('userId', currentUserId);
+            
+            showStatus('Configuration saved! Click "Load Notes" to continue.', 'success');
+        }
+
+        function showStatus(message, type = 'info') {
+            const statusDiv = document.getElementById('statusMessage');
+            statusDiv.innerHTML = `<div class="status-message status-${type}">${message}</div>`;
+            setTimeout(() => {
+                statusDiv.innerHTML = '';
+            }, 5000);
+        }
+
+        async function loadNotes() {
+            if (!API_ENDPOINT) {
+                showStatus('Please configure your API endpoint first', 'error');
+                return;
+            }
+
+            currentUserId = document.getElementById('userId').value.trim();
+            if (!currentUserId) {
+                showStatus('Please enter a User ID', 'error');
+                return;
+            }
+
+            localStorage.setItem('userId', currentUserId);
+
+            try {
+                document.getElementById('notesContainer').innerHTML = '<div class="loading">Loading notes...</div>';
+                
+                const response = await fetch(`${API_ENDPOINT}/notes/${currentUserId}`);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const data = await response.json();
+                displayNotes(data.notes || []);
+                showStatus(`Loaded ${data.notes?.length || 0} notes`, 'success');
+            } catch (error) {
+                console.error('Error loading notes:', error);
+                showStatus(`Error loading notes: ${error.message}`, 'error');
+                document.getElementById('notesContainer').innerHTML = `
+                    <div class="empty-state">
+                        <h3>Error Loading Notes</h3>
+                        <p>${error.message}</p>
+                        <p>Check your API endpoint and try again</p>
+                    </div>
+                `;
+            }
+        }
+
+        function displayNotes(notes) {
+            const container = document.getElementById('notesContainer');
+            
+            if (notes.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <h3>No notes yet</h3>
+                        <p>Create your first note above to get started!</p>
+                    </div>
+                `;
+                return;
+            }
+
+            // Sort notes by creation date (newest first)
+            notes.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+            container.innerHTML = '<div class="notes-grid">' + notes.map(note => `
+                <div class="note-card" id="note-${note.noteId}">
+                    <h3>${escapeHtml(note.title)}</h3>
+                    <div class="note-content">${escapeHtml(note.content)}</div>
+                    <div class="note-meta">
+                        Created: ${new Date(note.createdAt).toLocaleString()}
+                        ${note.updatedAt ? `<br>Updated: ${new Date(note.updatedAt).toLocaleString()}` : ''}
+                    </div>
+                    <div class="note-actions">
+                        <button class="btn-small btn-secondary" onclick="editNote('${note.noteId}', '${escapeHtml(note.title)}', '${escapeHtml(note.content)}')">Edit</button>
+                        <button class="btn-small btn-danger" onclick="deleteNote('${note.noteId}')">Delete</button>
+                    </div>
+                </div>
+            `).join('') + '</div>';
+        }
+
+        async function createNote() {
+            if (!API_ENDPOINT) {
+                showStatus('Please configure your API endpoint first', 'error');
+                return;
+            }
+
+            const title = document.getElementById('noteTitle').value.trim();
+            const content = document.getElementById('noteContent').value.trim();
+
+            if (!title || !content) {
+                showStatus('Please enter both title and content', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_ENDPOINT}/notes`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        userId: currentUserId,
+                        title: title,
+                        content: content
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+                
+                // Clear form
+                document.getElementById('noteTitle').value = '';
+                document.getElementById('noteContent').value = '';
+                
+                showStatus('Note created successfully!', 'success');
+                loadNotes();
+            } catch (error) {
+                console.error('Error creating note:', error);
+                showStatus(`Error creating note: ${error.message}`, 'error');
+            }
+        }
+
+        function editNote(noteId, title, content) {
+            const noteCard = document.getElementById(`note-${noteId}`);
+            
+            noteCard.innerHTML = `
+                <input type="text" id="edit-title-${noteId}" value="${title}" />
+                <textarea id="edit-content-${noteId}">${content}</textarea>
+                <div class="note-actions">
+                    <button class="btn-small btn-success" onclick="saveNote('${noteId}')">Save</button>
+                    <button class="btn-small btn-secondary" onclick="loadNotes()">Cancel</button>
+                </div>
+            `;
+            noteCard.classList.add('edit-mode');
+        }
+
+        async function saveNote(noteId) {
+            const title = document.getElementById(`edit-title-${noteId}`).value.trim();
+            const content = document.getElementById(`edit-content-${noteId}`).value.trim();
+
+            if (!title || !content) {
+                showStatus('Please enter both title and content', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_ENDPOINT}/notes/${currentUserId}/${noteId}`, {
+                    method: 'PUT',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        title: title,
+                        content: content
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                showStatus('Note updated successfully!', 'success');
+                loadNotes();
+            } catch (error) {
+                console.error('Error updating note:', error);
+                showStatus(`Error updating note: ${error.message}`, 'error');
+            }
+        }
+
+        async function deleteNote(noteId) {
+            if (!confirm('Are you sure you want to delete this note?')) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_ENDPOINT}/notes/${currentUserId}/${noteId}`, {
+                    method: 'DELETE'
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                showStatus('Note deleted successfully!', 'success');
+                loadNotes();
+            } catch (error) {
+                console.error('Error deleting note:', error);
+                showStatus(`Error deleting note: ${error.message}`, 'error');
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+    </script>
+</body>
+</html>
