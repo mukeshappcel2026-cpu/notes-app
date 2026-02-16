@@ -1,0 +1,205 @@
+name: Deploy to AWS
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Application
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Get EC2 instance ID
+        id: get-instance
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=NotesApp-EC2" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text)
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "Found instance: $INSTANCE_ID"
+
+      - name: Create deployment package
+        run: |
+          mkdir -p deploy
+          cp -r src package.json package-lock.json deploy/
+          cd deploy
+          tar -czf notes-app.tar.gz *
+          cd ..
+          mv deploy/notes-app.tar.gz .
+
+      - name: Upload to S3
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          S3_KEY="deployments/notes-app-${TIMESTAMP}.tar.gz"
+          aws s3 cp notes-app.tar.gz s3://${{ vars.DEPLOYMENT_BUCKET }}/${S3_KEY}
+          echo "S3_KEY=${S3_KEY}" >> $GITHUB_ENV
+
+      - name: Deploy to EC2 via SSM
+        run: |
+          aws ssm send-command \
+            --instance-ids ${{ steps.get-instance.outputs.instance_id }} \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "set -e",
+              "echo \"Starting deployment...\"",
+              "cd /home/ec2-user",
+              "aws s3 cp s3://${{ vars.DEPLOYMENT_BUCKET }}/${{ env.S3_KEY }} notes-app.tar.gz",
+              "mkdir -p notes-app-new",
+              "tar -xzf notes-app.tar.gz -C notes-app-new",
+              "cd notes-app-new",
+              "npm ci --production",
+              "sudo systemctl stop notes-app || true",
+              "cd /home/ec2-user",
+              "rm -rf notes-app-old",
+              "mv notes-app notes-app-old || true",
+              "mv notes-app-new notes-app",
+              "sudo systemctl start notes-app",
+              "sudo systemctl status notes-app",
+              "echo \"Deployment complete!\""
+            ]' \
+            --comment "Deploying notes-app from GitHub Actions" \
+            --output text
+
+      - name: Wait for deployment
+        run: |
+          echo "Waiting 30 seconds for application to start..."
+          sleep 30
+
+      - name: Health check
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names NotesApp-ALB \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+          
+          echo "Testing health endpoint: http://${ALB_DNS}/health"
+          
+          for i in {1..10}; do
+            if curl -f "http://${ALB_DNS}/health"; then
+              echo "✅ Health check passed!"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying..."
+            sleep 10
+          done
+          
+          echo "❌ Health check failed after 10 attempts"
+          exit 1
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "⚠️ Deployment failed, rolling back..."
+          aws ssm send-command \
+            --instance-ids ${{ steps.get-instance.outputs.instance_id }} \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "cd /home/ec2-user",
+              "sudo systemctl stop notes-app",
+              "rm -rf notes-app",
+              "mv notes-app-old notes-app || echo \"No previous version to rollback to\"",
+              "sudo systemctl start notes-app"
+            ]'
+
+  post-deploy-tests:
+    name: Post-Deployment Tests
+    needs: deploy
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Get ALB URL
+        id: get-url
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names NotesApp-ALB \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+          echo "api_url=http://${ALB_DNS}" >> $GITHUB_OUTPUT
+
+      - name: Run smoke tests
+        env:
+          API_URL: ${{ steps.get-url.outputs.api_url }}
+        run: |
+          echo "Running smoke tests against $API_URL"
+          
+          # Test health endpoint
+          curl -f "$API_URL/health" || exit 1
+          
+          # Test create note
+          NOTE_RESPONSE=$(curl -s -X POST "$API_URL/notes" \
+            -H "Content-Type: application/json" \
+            -d '{"userId":"test-user","title":"Smoke Test","content":"Testing deployment"}')
+          
+          NOTE_ID=$(echo $NOTE_RESPONSE | jq -r '.note.noteId')
+          echo "Created note: $NOTE_ID"
+          
+          # Test get notes
+          curl -f "$API_URL/notes/test-user" || exit 1
+          
+          # Test delete note
+          curl -f -X DELETE "$API_URL/notes/test-user/$NOTE_ID" || exit 1
+          
+          echo "✅ All smoke tests passed!"
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "🎉 Deployment successful!"
+          echo "Environment: ${{ github.event.inputs.environment || 'dev' }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "API URL: ${{ steps.get-url.outputs.api_url }}"
