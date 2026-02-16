@@ -1,4 +1,4 @@
-const { validateNote } = require('../../src/server');
+const { validateNote } = require('../../src/validators/note.validator');
 
 describe('validateNote', () => {
   test('should validate a correct note', () => {

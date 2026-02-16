@@ -1,6 +1,7 @@
 const request = require('supertest');
 const AWS = require('aws-sdk-mock');
-const { createApp } = require('../../src/server');
+const { createApp } = require('../../src/app');
+const { _resetClient } = require('../../src/services/note.service');
 
 describe('API E2E Tests', () => {
   let app;
@@ -13,10 +14,12 @@ describe('API E2E Tests', () => {
 
   beforeEach(() => {
     AWS.restore();
+    _resetClient();
   });
 
   afterAll(() => {
     AWS.restore();
+    _resetClient();
   });
 
   describe('GET /health', () => {
@@ -248,11 +251,31 @@ describe('API E2E Tests', () => {
     });
   });
 
-  describe('DELETE /notes/:userId/:noteId', () => {
-    test('should delete a note successfully', async () => {
-      AWS.mock('DynamoDB.DocumentClient', 'delete', (params, callback) => {
+  describe('DELETE /notes/:userId/:noteId (soft-delete)', () => {
+    test('should soft-delete a note successfully', async () => {
+      // deleteNote calls getNote (get) first, then update
+      AWS.mock('DynamoDB.DocumentClient', 'get', (params, callback) => {
         callback(null, {
-          Attributes: { userId: 'user123', noteId: 'note-456' }
+          Item: {
+            userId: 'user123',
+            noteId: 'note-456',
+            title: 'Note',
+            content: 'Content',
+            isDeleted: false,
+            deletedAt: null
+          }
+        });
+      });
+
+      AWS.mock('DynamoDB.DocumentClient', 'update', (params, callback) => {
+        callback(null, {
+          Attributes: {
+            userId: 'user123',
+            noteId: 'note-456',
+            isDeleted: true,
+            deletedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+          }
         });
       });
 
@@ -265,12 +288,31 @@ describe('API E2E Tests', () => {
     });
 
     test('should return 404 when note not found', async () => {
-      AWS.mock('DynamoDB.DocumentClient', 'delete', (params, callback) => {
+      AWS.mock('DynamoDB.DocumentClient', 'get', (params, callback) => {
         callback(null, {});
       });
 
       const response = await request(app)
         .delete('/notes/user123/nonexistent')
+        .expect(404);
+
+      expect(response.body.error).toBe('Note not found');
+    });
+
+    test('should return 404 when note is already soft-deleted', async () => {
+      AWS.mock('DynamoDB.DocumentClient', 'get', (params, callback) => {
+        callback(null, {
+          Item: {
+            userId: 'user123',
+            noteId: 'note-456',
+            isDeleted: true,
+            deletedAt: '2024-01-01T00:00:00.000Z'
+          }
+        });
+      });
+
+      const response = await request(app)
+        .delete('/notes/user123/note-456')
         .expect(404);
 
       expect(response.body.error).toBe('Note not found');

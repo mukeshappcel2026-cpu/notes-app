@@ -11,9 +11,10 @@ on:
         options:
           - dev
           - prod
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: ["CI - Test Application"]
+    types: [completed]
+    branches: [main]
 
 permissions:
   id-token: write   # Required for OIDC
@@ -21,22 +22,24 @@ permissions:
 
 jobs:
   deploy:
-    name: Deploy Application
+    name: Build & Deploy Docker Image
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.environment || 'dev' }}
-    
+    # Only deploy if CI passed (workflow_run) or if manually triggered (workflow_dispatch)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+
+    env:
+      DEPLOY_ENV: ${{ github.event.inputs.environment || 'dev' }}
+      DYNAMODB_TABLE: ${{ vars.DYNAMODB_TABLE || 'Notes' }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
         with:
-          node-version: '18'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci 
+          # For workflow_run, checkout the commit that triggered CI
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -44,114 +47,138 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Get ECR repository URL
+        id: ecr-repo
+        run: |
+          REPO_URL=$(aws ecr describe-repositories \
+            --repository-names "notesapp-${DEPLOY_ENV}" \
+            --query 'repositories[0].repositoryUri' \
+            --output text)
+          echo "repo_url=$REPO_URL" >> $GITHUB_OUTPUT
+          echo "ECR repo: $REPO_URL"
+
+      - name: Build and push Docker image
+        env:
+          ECR_REPO: ${{ steps.ecr-repo.outputs.repo_url }}
+          IMAGE_TAG: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          docker build -t $ECR_REPO:$IMAGE_TAG -t $ECR_REPO:latest .
+          docker push $ECR_REPO:$IMAGE_TAG
+          docker push $ECR_REPO:latest
+          echo "Pushed $ECR_REPO:$IMAGE_TAG"
+
       - name: Get EC2 instance ID
         id: get-instance
         run: |
           INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=NotesApp-EC2" \
+            --filters "Name=tag:Name,Values=NotesApp-*-EC2" \
                       "Name=instance-state-name,Values=running" \
             --query "Reservations[0].Instances[0].InstanceId" \
             --output text)
           echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
           echo "Found instance: $INSTANCE_ID"
 
-      - name: Create deployment package
+      - name: Deploy container to EC2 via SSM
+        env:
+          ECR_REPO: ${{ steps.ecr-repo.outputs.repo_url }}
+          IMAGE_TAG: ${{ github.event.workflow_run.head_sha || github.sha }}
+          REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
         run: |
-          mkdir -p deploy
-          cp -r src package.json package-lock.json deploy/
-          cd deploy
-          tar -czf notes-app.tar.gz *
-          cd ..
-          mv deploy/notes-app.tar.gz .
-
-      - name: Upload to S3
-        run: |
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          S3_KEY="deployments/notes-app-${TIMESTAMP}.tar.gz"
-          aws s3 cp notes-app.tar.gz s3://${{ vars.DEPLOYMENT_BUCKET }}/${S3_KEY}
-          echo "S3_KEY=${S3_KEY}" >> $GITHUB_ENV
-
-      - name: Deploy to EC2 via SSM
-        run: |
-          aws ssm send-command \
+          COMMAND_ID=$(aws ssm send-command \
             --instance-ids ${{ steps.get-instance.outputs.instance_id }} \
             --document-name "AWS-RunShellScript" \
-            --parameters 'commands=[
-              "set -e",
-              "echo \"Starting deployment...\"",
-              "cd /home/ec2-user",
-              "aws s3 cp s3://${{ vars.DEPLOYMENT_BUCKET }}/${{ env.S3_KEY }} notes-app.tar.gz",
-              "mkdir -p notes-app-new",
-              "tar -xzf notes-app.tar.gz -C notes-app-new",
-              "cd notes-app-new",
-              "npm ci --production",
-              "sudo systemctl stop notes-app || true",
-              "cd /home/ec2-user",
-              "rm -rf notes-app-old",
-              "mv notes-app notes-app-old || true",
-              "mv notes-app-new notes-app",
-              "sudo systemctl start notes-app",
-              "sudo systemctl status notes-app",
-              "echo \"Deployment complete!\""
-            ]' \
-            --comment "Deploying notes-app from GitHub Actions" \
-            --output text
+            --parameters "commands=[
+              \"set -e\",
+              \"echo 'Starting Docker deployment...'\",
+              \"REGION=${REGION}\",
+              \"ACCOUNT_ID=\$(aws sts get-caller-identity --query Account --output text --region \$REGION)\",
+              \"aws ecr get-login-password --region \$REGION | docker login --username AWS --password-stdin \$ACCOUNT_ID.dkr.ecr.\$REGION.amazonaws.com\",
+              \"docker pull ${ECR_REPO}:${IMAGE_TAG}\",
+              \"docker stop notes-app || true\",
+              \"docker rm notes-app || true\",
+              \"docker run -d --name notes-app --restart unless-stopped -p 3000:3000 -e PORT=3000 -e AWS_REGION=${REGION} -e DYNAMODB_TABLE=${DYNAMODB_TABLE} -e NODE_ENV=production -v /home/ec2-user/notes-app/logs:/app/logs ${ECR_REPO}:${IMAGE_TAG}\",
+              \"echo 'Deployment complete!'\",
+              \"docker ps\"
+            ]" \
+            --comment "Deploying notes-app:${IMAGE_TAG}" \
+            --query "Command.CommandId" \
+            --output text)
 
-      - name: Wait for deployment
-        run: |
-          echo "Waiting 30 seconds for application to start..."
-          sleep 30
+          echo "SSM Command ID: $COMMAND_ID"
+
+          # Wait for command to complete
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id ${{ steps.get-instance.outputs.instance_id }} \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+            echo "Command status: $STATUS"
+            if [ "$STATUS" = "Success" ]; then
+              echo "SSM command completed successfully"
+              break
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ]; then
+              echo "SSM command failed with status: $STATUS"
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id ${{ steps.get-instance.outputs.instance_id }}
+              exit 1
+            fi
+            sleep 10
+          done
 
       - name: Health check
         run: |
-          ALB_DNS=$(aws elbv2 describe-load-balancers \
-            --names NotesApp-ALB \
-            --query 'LoadBalancers[0].DNSName' \
+          INSTANCE_IP=$(aws ec2 describe-instances \
+            --instance-ids ${{ steps.get-instance.outputs.instance_id }} \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
             --output text)
-          
-          echo "Testing health endpoint: http://${ALB_DNS}/health"
-          
-          for i in {1..10}; do
-            if curl -f "http://${ALB_DNS}/health"; then
-              echo "✅ Health check passed!"
+
+          echo "Testing health endpoint: http://${INSTANCE_IP}:3000/health"
+
+          for i in $(seq 1 10); do
+            if curl -sf "http://${INSTANCE_IP}:3000/health"; then
+              echo ""
+              echo "Health check passed!"
               exit 0
             fi
             echo "Attempt $i failed, retrying..."
             sleep 10
           done
-          
-          echo "❌ Health check failed after 10 attempts"
+
+          echo "Health check failed after 10 attempts"
           exit 1
 
       - name: Rollback on failure
         if: failure()
+        env:
+          REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
         run: |
-          echo "⚠️ Deployment failed, rolling back..."
+          echo "Deployment failed, rolling back to previous container..."
           aws ssm send-command \
             --instance-ids ${{ steps.get-instance.outputs.instance_id }} \
             --document-name "AWS-RunShellScript" \
-            --parameters 'commands=[
-              "cd /home/ec2-user",
-              "sudo systemctl stop notes-app",
-              "rm -rf notes-app",
-              "mv notes-app-old notes-app || echo \"No previous version to rollback to\"",
-              "sudo systemctl start notes-app"
-            ]'
+            --parameters "commands=[
+              \"docker stop notes-app || true\",
+              \"docker rm notes-app || true\",
+              \"PREVIOUS=\$(docker images --format '{{.Repository}}:{{.Tag}}' | grep notesapp | grep -v latest | head -2 | tail -1)\",
+              \"if [ -n \\\"\$PREVIOUS\\\" ]; then docker run -d --name notes-app --restart unless-stopped -p 3000:3000 -e PORT=3000 -e AWS_REGION=${REGION} -e DYNAMODB_TABLE=${DYNAMODB_TABLE} -e NODE_ENV=production -v /home/ec2-user/notes-app/logs:/app/logs \$PREVIOUS; fi\",
+              \"docker ps\"
+            ]" \
+            --comment "Rolling back notes-app deployment"
 
   post-deploy-tests:
     name: Post-Deployment Tests
     needs: deploy
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.environment || 'dev' }}
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -159,44 +186,52 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
-      - name: Get ALB URL
+      - name: Get API URL
         id: get-url
         run: |
-          ALB_DNS=$(aws elbv2 describe-load-balancers \
-            --names NotesApp-ALB \
-            --query 'LoadBalancers[0].DNSName' \
+          INSTANCE_IP=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=NotesApp-*-EC2" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
             --output text)
-          echo "api_url=http://${ALB_DNS}" >> $GITHUB_OUTPUT
+          echo "api_url=http://${INSTANCE_IP}:3000" >> $GITHUB_OUTPUT
 
       - name: Run smoke tests
         env:
           API_URL: ${{ steps.get-url.outputs.api_url }}
         run: |
           echo "Running smoke tests against $API_URL"
-          
+
           # Test health endpoint
           curl -f "$API_URL/health" || exit 1
-          
+
           # Test create note
           NOTE_RESPONSE=$(curl -s -X POST "$API_URL/notes" \
             -H "Content-Type: application/json" \
             -d '{"userId":"test-user","title":"Smoke Test","content":"Testing deployment"}')
-          
+
           NOTE_ID=$(echo $NOTE_RESPONSE | jq -r '.note.noteId')
           echo "Created note: $NOTE_ID"
-          
+
           # Test get notes
           curl -f "$API_URL/notes/test-user" || exit 1
-          
-          # Test delete note
+
+          # Test soft-delete note
           curl -f -X DELETE "$API_URL/notes/test-user/$NOTE_ID" || exit 1
-          
-          echo "✅ All smoke tests passed!"
+
+          # Verify soft-deleted note returns 404
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/notes/test-user/$NOTE_ID")
+          if [ "$STATUS" != "404" ]; then
+            echo "Expected 404 for soft-deleted note, got $STATUS"
+            exit 1
+          fi
+
+          echo "All smoke tests passed!"
 
       - name: Notify deployment success
         if: success()
         run: |
-          echo "🎉 Deployment successful!"
+          echo "Deployment successful!"
           echo "Environment: ${{ github.event.inputs.environment || 'dev' }}"
           echo "Commit: ${{ github.sha }}"
           echo "API URL: ${{ steps.get-url.outputs.api_url }}"

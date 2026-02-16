@@ -1,0 +1,14 @@
+node_modules
+npm-debug.log
+tests
+coverage
+.git
+.github
+.env
+.env.local
+*.tar.gz
+*.md
+.eslintrc*
+.gitignore
+docker-compose.yml
+Dockerfile

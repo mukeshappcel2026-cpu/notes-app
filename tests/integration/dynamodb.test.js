@@ -4,17 +4,20 @@ const {
   getNotesFromDb,
   getNoteFromDb,
   updateNoteInDb,
-  deleteNoteFromDb
-} = require('../../src/server');
+  deleteNoteFromDb,
+  _resetClient
+} = require('../../src/services/note.service');
 
 describe('DynamoDB Integration Tests', () => {
   beforeEach(() => {
-    // Clear all mocks before each test
+    // Clear all mocks and reset cached client before each test
     AWS.restore();
+    _resetClient();
   });
 
   afterAll(() => {
     AWS.restore();
+    _resetClient();
   });
 
   describe('createNoteInDb', () => {
@@ -146,42 +149,95 @@ describe('DynamoDB Integration Tests', () => {
     });
   });
 
-  describe('deleteNoteFromDb', () => {
-    test('should delete a note successfully', async () => {
-      const deletedNote = {
+  describe('deleteNoteFromDb (soft-delete)', () => {
+    test('should soft-delete a note successfully', async () => {
+      // deleteNote first calls getNote (get), then does an update
+      const existingNote = {
         userId: 'user123',
         noteId: 'note-456',
-        title: 'Deleted Note',
-        content: 'Deleted Content'
+        title: 'Existing Note',
+        content: 'Existing Content',
+        isDeleted: false,
+        deletedAt: null
       };
 
-      AWS.mock('DynamoDB.DocumentClient', 'delete', (params, callback) => {
+      const softDeletedNote = {
+        ...existingNote,
+        isDeleted: true,
+        deletedAt: expect.any(String),
+        updatedAt: expect.any(String)
+      };
+
+      AWS.mock('DynamoDB.DocumentClient', 'get', (params, callback) => {
+        callback(null, { Item: existingNote });
+      });
+
+      AWS.mock('DynamoDB.DocumentClient', 'update', (params, callback) => {
         expect(params.Key.userId).toBe('user123');
         expect(params.Key.noteId).toBe('note-456');
-        callback(null, { Attributes: deletedNote });
+        expect(params.ExpressionAttributeValues[':isDeleted']).toBe(true);
+        expect(params.ExpressionAttributeValues[':deletedAt']).toBeDefined();
+        callback(null, { Attributes: softDeletedNote });
       });
 
       const result = await deleteNoteFromDb('user123', 'note-456');
-      
-      expect(result).toEqual(deletedNote);
+
+      expect(result).toHaveProperty('isDeleted', true);
+      expect(result).toHaveProperty('deletedAt');
     });
 
-    test('should return undefined when note to delete not found', async () => {
-      AWS.mock('DynamoDB.DocumentClient', 'delete', (params, callback) => {
+    test('should return null when note to delete not found', async () => {
+      AWS.mock('DynamoDB.DocumentClient', 'get', (params, callback) => {
         callback(null, {});
       });
 
       const result = await deleteNoteFromDb('user123', 'nonexistent');
-      expect(result).toBeUndefined();
+      expect(result).toBeNull();
     });
 
-    test('should handle DynamoDB errors', async () => {
-      AWS.mock('DynamoDB.DocumentClient', 'delete', (params, callback) => {
-        callback(new Error('Delete failed'), null);
+    test('should return null when note is already soft-deleted', async () => {
+      AWS.mock('DynamoDB.DocumentClient', 'get', (params, callback) => {
+        callback(null, {
+          Item: {
+            userId: 'user123',
+            noteId: 'note-456',
+            isDeleted: true,
+            deletedAt: '2024-01-01T00:00:00.000Z'
+          }
+        });
+      });
+
+      const result = await deleteNoteFromDb('user123', 'note-456');
+      expect(result).toBeNull();
+    });
+
+    test('should handle DynamoDB errors on get', async () => {
+      AWS.mock('DynamoDB.DocumentClient', 'get', (params, callback) => {
+        callback(new Error('Get failed'), null);
       });
 
       await expect(deleteNoteFromDb('user123', 'note-456'))
-        .rejects.toThrow('Delete failed');
+        .rejects.toThrow('Get failed');
+    });
+
+    test('should handle DynamoDB errors on update', async () => {
+      AWS.mock('DynamoDB.DocumentClient', 'get', (params, callback) => {
+        callback(null, {
+          Item: {
+            userId: 'user123',
+            noteId: 'note-456',
+            isDeleted: false,
+            deletedAt: null
+          }
+        });
+      });
+
+      AWS.mock('DynamoDB.DocumentClient', 'update', (params, callback) => {
+        callback(new Error('Update failed'), null);
+      });
+
+      await expect(deleteNoteFromDb('user123', 'note-456'))
+        .rejects.toThrow('Update failed');
     });
   });
 });
