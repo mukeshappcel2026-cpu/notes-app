@@ -23,6 +23,7 @@ COPY --from=builder /app/node_modules ./node_modules
 # Copy application source
 COPY package*.json ./
 COPY src/ ./src/
+COPY public/ ./public/
 
 # Set ownership to non-root user
 RUN chown -R appuser:appgroup /app

@@ -1,4 +1,5 @@
 const express = require('express');
+const path = require('path');
 const bodyParser = require('body-parser');
 const { globalLimiter } = require('./middleware/rateLimiter');
 const corsMiddleware = require('./middleware/cors');
@@ -15,6 +16,9 @@ function createApp() {
   app.use(globalLimiter);
   app.use(corsMiddleware);
   app.use(requestLogger);
+
+  // Serve frontend static files
+  app.use(express.static(path.join(__dirname, '..', 'public')));
 
   // Routes
   app.use(healthRoutes);

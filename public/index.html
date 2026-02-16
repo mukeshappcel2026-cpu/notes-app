@@ -317,8 +317,13 @@
             if (savedEndpoint) {
                 API_ENDPOINT = savedEndpoint;
                 document.getElementById('apiEndpoint').value = savedEndpoint;
+            } else {
+                // Auto-detect: use current page's base URL (handles API Gateway stage paths like /dev)
+                const basePath = window.location.pathname.replace(/\/index\.html$/, '').replace(/\/$/, '');
+                API_ENDPOINT = window.location.origin + basePath;
+                document.getElementById('apiEndpoint').value = API_ENDPOINT;
             }
-            
+
             if (savedUserId) {
                 currentUserId = savedUserId;
                 document.getElementById('userId').value = savedUserId;
@@ -330,7 +335,7 @@
                 showStatus('Please configure your API endpoint first', 'info');
                 document.getElementById('notesContainer').innerHTML = `
                     <div class="empty-state">
-                        <h3>Welcome! 👋</h3>
+                        <h3>Welcome!</h3>
                         <p>Enter your API endpoint above to get started</p>
                     </div>
                 `;
