@@ -1,6 +1,7 @@
 const express = require('express');
 const path = require('path');
 const bodyParser = require('body-parser');
+const config = require('./config');
 const { globalLimiter } = require('./middleware/rateLimiter');
 const corsMiddleware = require('./middleware/cors');
 const requestLogger = require('./middleware/requestLogger');
@@ -19,6 +20,11 @@ function createApp() {
 
   // Serve frontend static files
   app.use(express.static(path.join(__dirname, '..', 'public')));
+
+  // Auth config endpoint (public - no auth required)
+  app.get('/auth/config', (req, res) => {
+    res.json({ clientId: config.googleClientId || null });
+  });
 
   // Routes
   app.use(healthRoutes);

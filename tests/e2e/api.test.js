@@ -35,6 +35,26 @@ describe('API E2E Tests', () => {
     });
   });
 
+  describe('GET /auth/config', () => {
+    test('should return auth configuration', async () => {
+      const response = await request(app)
+        .get('/auth/config')
+        .expect(200);
+
+      expect(response.body).toHaveProperty('clientId');
+    });
+  });
+
+  describe('Authentication', () => {
+    test('should return 401 when no auth header on protected route', async () => {
+      const response = await request(app)
+        .get('/notes')
+        .expect(401);
+
+      expect(response.body.error).toBe('Authorization header required');
+    });
+  });
+
   describe('POST /notes', () => {
     test('should create a note successfully', async () => {
       AWS.mock('DynamoDB.DocumentClient', 'put', (params, callback) => {
@@ -43,8 +63,8 @@ describe('API E2E Tests', () => {
 
       const response = await request(app)
         .post('/notes')
+        .set('X-Test-User-Id', 'user123')
         .send({
-          userId: 'user123',
           title: 'Test Note',
           content: 'Test Content'
         })
@@ -57,23 +77,11 @@ describe('API E2E Tests', () => {
       expect(response.body.note).toHaveProperty('noteId');
     });
 
-    test('should return 400 for missing userId', async () => {
-      const response = await request(app)
-        .post('/notes')
-        .send({
-          title: 'Test Note',
-          content: 'Test Content'
-        })
-        .expect(400);
-
-      expect(response.body.error).toContain('userId');
-    });
-
     test('should return 400 for missing title', async () => {
       const response = await request(app)
         .post('/notes')
+        .set('X-Test-User-Id', 'user123')
         .send({
-          userId: 'user123',
           content: 'Test Content'
         })
         .expect(400);
@@ -84,8 +92,8 @@ describe('API E2E Tests', () => {
     test('should return 400 for missing content', async () => {
       const response = await request(app)
         .post('/notes')
+        .set('X-Test-User-Id', 'user123')
         .send({
-          userId: 'user123',
           title: 'Test Note'
         })
         .expect(400);
@@ -100,8 +108,8 @@ describe('API E2E Tests', () => {
 
       const response = await request(app)
         .post('/notes')
+        .set('X-Test-User-Id', 'user123')
         .send({
-          userId: 'user123',
           title: 'Test Note',
           content: 'Test Content'
         })
@@ -111,8 +119,8 @@ describe('API E2E Tests', () => {
     });
   });
 
-  describe('GET /notes/:userId', () => {
-    test('should get all notes for a user', async () => {
+  describe('GET /notes', () => {
+    test('should get all notes for authenticated user', async () => {
       const mockNotes = [
         { userId: 'user123', noteId: '1', title: 'Note 1', content: 'Content 1' },
         { userId: 'user123', noteId: '2', title: 'Note 2', content: 'Content 2' }
@@ -123,7 +131,8 @@ describe('API E2E Tests', () => {
       });
 
       const response = await request(app)
-        .get('/notes/user123')
+        .get('/notes')
+        .set('X-Test-User-Id', 'user123')
         .expect(200);
 
       expect(response.body.notes).toHaveLength(2);
@@ -137,7 +146,8 @@ describe('API E2E Tests', () => {
       });
 
       const response = await request(app)
-        .get('/notes/user123')
+        .get('/notes')
+        .set('X-Test-User-Id', 'user123')
         .expect(200);
 
       expect(response.body.notes).toEqual([]);
@@ -150,14 +160,15 @@ describe('API E2E Tests', () => {
       });
 
       const response = await request(app)
-        .get('/notes/user123')
+        .get('/notes')
+        .set('X-Test-User-Id', 'user123')
         .expect(500);
 
       expect(response.body.error).toBe('Failed to retrieve notes');
     });
   });
 
-  describe('GET /notes/:userId/:noteId', () => {
+  describe('GET /notes/:noteId', () => {
     test('should get a specific note', async () => {
       const mockNote = {
         userId: 'user123',
@@ -171,7 +182,8 @@ describe('API E2E Tests', () => {
       });
 
       const response = await request(app)
-        .get('/notes/user123/note-456')
+        .get('/notes/note-456')
+        .set('X-Test-User-Id', 'user123')
         .expect(200);
 
       expect(response.body.note).toEqual(mockNote);
@@ -183,14 +195,15 @@ describe('API E2E Tests', () => {
       });
 
       const response = await request(app)
-        .get('/notes/user123/nonexistent')
+        .get('/notes/nonexistent')
+        .set('X-Test-User-Id', 'user123')
         .expect(404);
 
       expect(response.body.error).toBe('Note not found');
     });
   });
 
-  describe('PUT /notes/:userId/:noteId', () => {
+  describe('PUT /notes/:noteId', () => {
     test('should update a note successfully', async () => {
       // Mock the get operation (check if exists)
       AWS.mock('DynamoDB.DocumentClient', 'get', (params, callback) => {
@@ -212,7 +225,8 @@ describe('API E2E Tests', () => {
       });
 
       const response = await request(app)
-        .put('/notes/user123/note-456')
+        .put('/notes/note-456')
+        .set('X-Test-User-Id', 'user123')
         .send({
           title: 'Updated Title',
           content: 'Updated Content'
@@ -225,7 +239,8 @@ describe('API E2E Tests', () => {
 
     test('should return 400 for missing title', async () => {
       const response = await request(app)
-        .put('/notes/user123/note-456')
+        .put('/notes/note-456')
+        .set('X-Test-User-Id', 'user123')
         .send({
           content: 'Updated Content'
         })
@@ -240,7 +255,8 @@ describe('API E2E Tests', () => {
       });
 
       const response = await request(app)
-        .put('/notes/user123/nonexistent')
+        .put('/notes/nonexistent')
+        .set('X-Test-User-Id', 'user123')
         .send({
           title: 'Updated Title',
           content: 'Updated Content'
@@ -251,7 +267,7 @@ describe('API E2E Tests', () => {
     });
   });
 
-  describe('DELETE /notes/:userId/:noteId (soft-delete)', () => {
+  describe('DELETE /notes/:noteId (soft-delete)', () => {
     test('should soft-delete a note successfully', async () => {
       // deleteNote calls getNote (get) first, then update
       AWS.mock('DynamoDB.DocumentClient', 'get', (params, callback) => {
@@ -280,7 +296,8 @@ describe('API E2E Tests', () => {
       });
 
       const response = await request(app)
-        .delete('/notes/user123/note-456')
+        .delete('/notes/note-456')
+        .set('X-Test-User-Id', 'user123')
         .expect(200);
 
       expect(response.body.message).toBe('Note deleted successfully');
@@ -293,7 +310,8 @@ describe('API E2E Tests', () => {
       });
 
       const response = await request(app)
-        .delete('/notes/user123/nonexistent')
+        .delete('/notes/nonexistent')
+        .set('X-Test-User-Id', 'user123')
         .expect(404);
 
       expect(response.body.error).toBe('Note not found');
@@ -312,7 +330,8 @@ describe('API E2E Tests', () => {
       });
 
       const response = await request(app)
-        .delete('/notes/user123/note-456')
+        .delete('/notes/note-456')
+        .set('X-Test-User-Id', 'user123')
         .expect(404);
 
       expect(response.body.error).toBe('Note not found');

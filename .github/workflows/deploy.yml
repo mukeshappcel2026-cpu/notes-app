@@ -33,6 +33,7 @@ jobs:
     env:
       DEPLOY_ENV: ${{ github.event.inputs.environment || 'dev' }}
       DYNAMODB_TABLE: ${{ vars.DYNAMODB_TABLE || 'Notes' }}
+      GOOGLE_CLIENT_ID: ${{ vars.GOOGLE_CLIENT_ID }}
 
     steps:
       - name: Checkout code
@@ -100,7 +101,7 @@ jobs:
               \"docker pull ${ECR_REPO}:${IMAGE_TAG}\",
               \"docker stop notes-app || true\",
               \"docker rm notes-app || true\",
-              \"docker run -d --name notes-app --restart unless-stopped -p 3000:3000 -e PORT=3000 -e AWS_REGION=${REGION} -e DYNAMODB_TABLE=${DYNAMODB_TABLE} -e NODE_ENV=production -v /home/ec2-user/notes-app/logs:/app/logs ${ECR_REPO}:${IMAGE_TAG}\",
+              \"docker run -d --name notes-app --restart unless-stopped -p 3000:3000 -e PORT=3000 -e AWS_REGION=${REGION} -e DYNAMODB_TABLE=${DYNAMODB_TABLE} -e GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID} -e NODE_ENV=production -v /home/ec2-user/notes-app/logs:/app/logs ${ECR_REPO}:${IMAGE_TAG}\",
               \"echo 'Deployment complete!'\",
               \"docker ps\"
             ]" \
@@ -165,7 +166,7 @@ jobs:
               \"docker stop notes-app || true\",
               \"docker rm notes-app || true\",
               \"PREVIOUS=\$(docker images --format '{{.Repository}}:{{.Tag}}' | grep notesapp | grep -v latest | head -2 | tail -1)\",
-              \"if [ -n \\\"\$PREVIOUS\\\" ]; then docker run -d --name notes-app --restart unless-stopped -p 3000:3000 -e PORT=3000 -e AWS_REGION=${REGION} -e DYNAMODB_TABLE=${DYNAMODB_TABLE} -e NODE_ENV=production -v /home/ec2-user/notes-app/logs:/app/logs \$PREVIOUS; fi\",
+              \"if [ -n \\\"\$PREVIOUS\\\" ]; then docker run -d --name notes-app --restart unless-stopped -p 3000:3000 -e PORT=3000 -e AWS_REGION=${REGION} -e DYNAMODB_TABLE=${DYNAMODB_TABLE} -e GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID} -e NODE_ENV=production -v /home/ec2-user/notes-app/logs:/app/logs \$PREVIOUS; fi\",
               \"docker ps\"
             ]" \
             --comment "Rolling back notes-app deployment"
@@ -203,28 +204,21 @@ jobs:
           echo "Running smoke tests against $API_URL"
 
           # Test health endpoint
-          curl -f "$API_URL/health" || exit 1
+          echo "Testing /health..."
+          curl -sf "$API_URL/health" | jq . || exit 1
 
-          # Test create note
-          NOTE_RESPONSE=$(curl -s -X POST "$API_URL/notes" \
-            -H "Content-Type: application/json" \
-            -d '{"userId":"test-user","title":"Smoke Test","content":"Testing deployment"}')
+          # Test auth config endpoint
+          echo "Testing /auth/config..."
+          curl -sf "$API_URL/auth/config" | jq . || exit 1
 
-          NOTE_ID=$(echo $NOTE_RESPONSE | jq -r '.note.noteId')
-          echo "Created note: $NOTE_ID"
-
-          # Test get notes
-          curl -f "$API_URL/notes/test-user" || exit 1
-
-          # Test soft-delete note
-          curl -f -X DELETE "$API_URL/notes/test-user/$NOTE_ID" || exit 1
-
-          # Verify soft-deleted note returns 404
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/notes/test-user/$NOTE_ID")
-          if [ "$STATUS" != "404" ]; then
-            echo "Expected 404 for soft-deleted note, got $STATUS"
+          # Test that note routes require authentication (should return 401)
+          echo "Testing /notes requires auth..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/notes")
+          if [ "$STATUS" != "401" ]; then
+            echo "Expected 401 for unauthenticated /notes, got $STATUS"
             exit 1
           fi
+          echo "Auth check passed (401 as expected)"
 
           echo "All smoke tests passed!"
 

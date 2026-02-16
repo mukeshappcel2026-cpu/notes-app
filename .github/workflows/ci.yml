@@ -154,6 +154,7 @@ jobs:
             -e AWS_REGION=us-east-1 \
             -e DYNAMODB_TABLE=Notes \
             -e NODE_ENV=test \
+            -e GOOGLE_CLIENT_ID=test-client-id \
             notes-app:ci-${{ github.sha }}
 
           # Wait for container to be healthy

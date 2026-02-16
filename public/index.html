@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Notes App</title>
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
     <style>
         * {
             margin: 0;
@@ -39,23 +40,76 @@
             opacity: 0.9;
         }
 
-        .config-section {
+        /* User bar - shown when logged in */
+        .user-bar {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            margin-top: 15px;
+            padding: 10px 20px;
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 30px;
+            display: inline-flex;
+        }
+
+        .user-avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            border: 2px solid white;
+        }
+
+        .user-name {
+            font-size: 0.95rem;
+            font-weight: 500;
+        }
+
+        .user-email {
+            font-size: 0.8rem;
+            opacity: 0.8;
+        }
+
+        .btn-signout {
+            padding: 6px 14px;
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.4);
+            border-radius: 20px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .btn-signout:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: none;
+            box-shadow: none;
+        }
+
+        /* Login section */
+        .login-section {
+            text-align: center;
+            padding: 60px 20px;
             background: white;
-            padding: 20px;
             border-radius: 12px;
             box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-            margin-bottom: 20px;
         }
 
-        .config-section h3 {
-            margin-bottom: 15px;
+        .login-section h3 {
             color: #333;
+            margin-bottom: 10px;
+            font-size: 1.4rem;
         }
 
-        .input-group {
+        .login-section p {
+            color: #666;
+            margin-bottom: 25px;
+        }
+
+        #googleSignInButton {
             display: flex;
-            gap: 10px;
-            margin-bottom: 10px;
+            justify-content: center;
         }
 
         input[type="text"] {
@@ -65,6 +119,7 @@
             border-radius: 8px;
             font-size: 1rem;
             transition: border-color 0.3s;
+            width: 100%;
         }
 
         input[type="text"]:focus {
@@ -253,6 +308,10 @@
             color: #333;
         }
 
+        .hidden {
+            display: none !important;
+        }
+
         @media (max-width: 768px) {
             h1 {
                 font-size: 2rem;
@@ -262,8 +321,9 @@
                 grid-template-columns: 1fr;
             }
 
-            .input-group {
+            .user-bar {
                 flex-direction: column;
+                gap: 8px;
             }
         }
     </style>
@@ -271,94 +331,199 @@
 <body>
     <div class="container">
         <header>
-            <h1>📝 Notes App</h1>
+            <h1>Notes App</h1>
             <p class="subtitle">Your personal cloud notebook</p>
+            <!-- User info bar (hidden when logged out) -->
+            <div id="userBar" class="hidden">
+                <div class="user-bar">
+                    <img id="userAvatar" class="user-avatar" src="" alt="avatar" />
+                    <div>
+                        <div id="userName" class="user-name"></div>
+                        <div id="userEmail" class="user-email"></div>
+                    </div>
+                    <button class="btn-signout" onclick="signOut()">Sign Out</button>
+                </div>
+            </div>
         </header>
 
-        <!-- Configuration Section -->
-        <div class="config-section">
-            <h3>⚙️ Configuration</h3>
-            <div class="input-group">
-                <input type="text" id="apiEndpoint" placeholder="API Endpoint (e.g., http://your-alb-url or https://api-gateway-url/prod)" value="">
-                <button onclick="saveConfig()">Save Config</button>
-            </div>
-            <div class="input-group">
-                <input type="text" id="userId" placeholder="Your User ID (e.g., user123)" value="user123">
-                <button class="btn-success" onclick="loadNotes()">Load Notes</button>
-            </div>
+        <!-- Login section (visible when logged out) -->
+        <div id="loginSection" class="login-section">
+            <h3>Welcome</h3>
+            <p>Sign in with your Google account to access your notes</p>
+            <div id="googleSignInButton"></div>
         </div>
 
-        <div id="statusMessage"></div>
+        <!-- App section (hidden when logged out) -->
+        <div id="appSection" class="hidden">
+            <div id="statusMessage"></div>
 
-        <!-- New Note Section -->
-        <div class="new-note-section">
-            <h3>✨ Create New Note</h3>
-            <input type="text" id="noteTitle" placeholder="Note Title" />
-            <textarea id="noteContent" placeholder="What's on your mind?"></textarea>
-            <button onclick="createNote()">Create Note</button>
-        </div>
+            <!-- New Note Section -->
+            <div class="new-note-section">
+                <h3>Create New Note</h3>
+                <input type="text" id="noteTitle" placeholder="Note Title" />
+                <textarea id="noteContent" placeholder="What's on your mind?"></textarea>
+                <button onclick="createNote()">Create Note</button>
+            </div>
 
-        <!-- Notes Grid -->
-        <div id="notesContainer">
-            <div class="loading">Loading notes...</div>
+            <!-- Notes Grid -->
+            <div id="notesContainer">
+                <div class="loading">Loading notes...</div>
+            </div>
         </div>
     </div>
 
     <script>
-        // Configuration
-        let API_ENDPOINT = '';
-        let currentUserId = 'user123';
+        // State
+        let BASE_URL = '';
+        let authToken = null;
+        let currentUser = null;
 
-        // Load saved configuration
-        window.addEventListener('DOMContentLoaded', () => {
-            const savedEndpoint = localStorage.getItem('apiEndpoint');
-            const savedUserId = localStorage.getItem('userId');
-            
-            if (savedEndpoint) {
-                API_ENDPOINT = savedEndpoint;
-                document.getElementById('apiEndpoint').value = savedEndpoint;
-            } else {
-                // Auto-detect: use current page's base URL (handles API Gateway stage paths like /dev)
-                const basePath = window.location.pathname.replace(/\/index\.html$/, '').replace(/\/$/, '');
-                API_ENDPOINT = window.location.origin + basePath;
-                document.getElementById('apiEndpoint').value = API_ENDPOINT;
-            }
+        // Auto-detect base URL (handles API Gateway stage paths like /dev)
+        const basePath = window.location.pathname.replace(/\/index\.html$/, '').replace(/\/$/, '');
+        BASE_URL = basePath;
 
-            if (savedUserId) {
-                currentUserId = savedUserId;
-                document.getElementById('userId').value = savedUserId;
-            }
+        // Initialize on page load
+        window.addEventListener('DOMContentLoaded', async () => {
+            try {
+                const resp = await fetch(`${BASE_URL}/auth/config`);
+                const { clientId } = await resp.json();
 
-            if (API_ENDPOINT) {
-                loadNotes();
-            } else {
-                showStatus('Please configure your API endpoint first', 'info');
-                document.getElementById('notesContainer').innerHTML = `
+                if (!clientId) {
+                    document.getElementById('loginSection').innerHTML = `
+                        <div class="empty-state">
+                            <h3>Authentication Not Configured</h3>
+                            <p>The server does not have a Google Client ID configured.</p>
+                            <p>Please set the GOOGLE_CLIENT_ID environment variable.</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                // Wait for Google Identity Services to load
+                const waitForGoogle = () => new Promise((resolve) => {
+                    if (window.google && google.accounts) {
+                        resolve();
+                    } else {
+                        const check = setInterval(() => {
+                            if (window.google && google.accounts) {
+                                clearInterval(check);
+                                resolve();
+                            }
+                        }, 100);
+                        // Timeout after 10 seconds
+                        setTimeout(() => { clearInterval(check); resolve(); }, 10000);
+                    }
+                });
+
+                await waitForGoogle();
+
+                if (!window.google || !google.accounts) {
+                    document.getElementById('loginSection').innerHTML = `
+                        <div class="empty-state">
+                            <h3>Failed to Load Google Sign-In</h3>
+                            <p>Please check your internet connection and try again.</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                google.accounts.id.initialize({
+                    client_id: clientId,
+                    callback: handleCredentialResponse,
+                    auto_select: true,
+                });
+
+                google.accounts.id.renderButton(
+                    document.getElementById('googleSignInButton'),
+                    { theme: 'outline', size: 'large', width: 300, text: 'signin_with' }
+                );
+
+                // Show One Tap prompt
+                google.accounts.id.prompt();
+
+            } catch (error) {
+                console.error('Failed to initialize auth:', error);
+                document.getElementById('loginSection').innerHTML = `
                     <div class="empty-state">
-                        <h3>Welcome!</h3>
-                        <p>Enter your API endpoint above to get started</p>
+                        <h3>Connection Error</h3>
+                        <p>Could not connect to the server. Please try again later.</p>
                     </div>
                 `;
             }
         });
 
-        function saveConfig() {
-            const endpoint = document.getElementById('apiEndpoint').value.trim();
-            const userId = document.getElementById('userId').value.trim();
-            
-            if (!endpoint) {
-                showStatus('Please enter an API endpoint', 'error');
+        function handleCredentialResponse(response) {
+            authToken = response.credential;
+
+            // Decode JWT payload (base64url)
+            try {
+                const parts = authToken.split('.');
+                const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+                currentUser = {
+                    name: payload.name,
+                    email: payload.email,
+                    picture: payload.picture,
+                    sub: payload.sub,
+                };
+            } catch (e) {
+                console.error('Failed to decode token:', e);
+                showStatus('Authentication failed. Please try again.', 'error');
                 return;
             }
 
-            // Remove trailing slash if present
-            API_ENDPOINT = endpoint.replace(/\/$/, '');
-            currentUserId = userId;
-            
-            localStorage.setItem('apiEndpoint', API_ENDPOINT);
-            localStorage.setItem('userId', currentUserId);
-            
-            showStatus('Configuration saved! Click "Load Notes" to continue.', 'success');
+            showLoggedInUI();
+            loadNotes();
+        }
+
+        function showLoggedInUI() {
+            document.getElementById('loginSection').classList.add('hidden');
+            document.getElementById('appSection').classList.remove('hidden');
+            document.getElementById('userBar').classList.remove('hidden');
+
+            document.getElementById('userName').textContent = currentUser.name;
+            document.getElementById('userEmail').textContent = currentUser.email;
+            if (currentUser.picture) {
+                document.getElementById('userAvatar').src = currentUser.picture;
+            }
+        }
+
+        function showLoggedOutUI() {
+            document.getElementById('loginSection').classList.remove('hidden');
+            document.getElementById('appSection').classList.add('hidden');
+            document.getElementById('userBar').classList.add('hidden');
+        }
+
+        function signOut() {
+            if (window.google && google.accounts) {
+                google.accounts.id.disableAutoSelect();
+            }
+            authToken = null;
+            currentUser = null;
+            showLoggedOutUI();
+        }
+
+        // Fetch wrapper that adds auth header and handles 401
+        async function authFetch(url, options = {}) {
+            if (!authToken) {
+                showStatus('Please sign in first.', 'error');
+                throw new Error('Not authenticated');
+            }
+
+            const response = await fetch(url, {
+                ...options,
+                headers: {
+                    ...options.headers,
+                    'Authorization': `Bearer ${authToken}`,
+                },
+            });
+
+            if (response.status === 401) {
+                showStatus('Session expired. Please sign in again.', 'info');
+                signOut();
+                throw new Error('Session expired');
+            }
+
+            return response;
         }
 
         function showStatus(message, type = 'info') {
@@ -370,39 +535,26 @@
         }
 
         async function loadNotes() {
-            if (!API_ENDPOINT) {
-                showStatus('Please configure your API endpoint first', 'error');
-                return;
-            }
-
-            currentUserId = document.getElementById('userId').value.trim();
-            if (!currentUserId) {
-                showStatus('Please enter a User ID', 'error');
-                return;
-            }
-
-            localStorage.setItem('userId', currentUserId);
-
             try {
                 document.getElementById('notesContainer').innerHTML = '<div class="loading">Loading notes...</div>';
-                
-                const response = await fetch(`${API_ENDPOINT}/notes/${currentUserId}`);
-                
+
+                const response = await authFetch(`${BASE_URL}/notes`);
+
                 if (!response.ok) {
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
-                
+
                 const data = await response.json();
                 displayNotes(data.notes || []);
                 showStatus(`Loaded ${data.notes?.length || 0} notes`, 'success');
             } catch (error) {
+                if (error.message === 'Session expired' || error.message === 'Not authenticated') return;
                 console.error('Error loading notes:', error);
                 showStatus(`Error loading notes: ${error.message}`, 'error');
                 document.getElementById('notesContainer').innerHTML = `
                     <div class="empty-state">
                         <h3>Error Loading Notes</h3>
-                        <p>${error.message}</p>
-                        <p>Check your API endpoint and try again</p>
+                        <p>${escapeHtml(error.message)}</p>
                     </div>
                 `;
             }
@@ -410,7 +562,7 @@
 
         function displayNotes(notes) {
             const container = document.getElementById('notesContainer');
-            
+
             if (notes.length === 0) {
                 container.innerHTML = `
                     <div class="empty-state">
@@ -441,11 +593,6 @@
         }
 
         async function createNote() {
-            if (!API_ENDPOINT) {
-                showStatus('Please configure your API endpoint first', 'error');
-                return;
-            }
-
             const title = document.getElementById('noteTitle').value.trim();
             const content = document.getElementById('noteContent').value.trim();
 
@@ -455,31 +602,26 @@
             }
 
             try {
-                const response = await fetch(`${API_ENDPOINT}/notes`, {
+                const response = await authFetch(`${BASE_URL}/notes`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({
-                        userId: currentUserId,
-                        title: title,
-                        content: content
-                    })
+                    body: JSON.stringify({ title, content })
                 });
 
                 if (!response.ok) {
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
 
-                const data = await response.json();
-                
                 // Clear form
                 document.getElementById('noteTitle').value = '';
                 document.getElementById('noteContent').value = '';
-                
+
                 showStatus('Note created successfully!', 'success');
                 loadNotes();
             } catch (error) {
+                if (error.message === 'Session expired' || error.message === 'Not authenticated') return;
                 console.error('Error creating note:', error);
                 showStatus(`Error creating note: ${error.message}`, 'error');
             }
@@ -487,7 +629,7 @@
 
         function editNote(noteId, title, content) {
             const noteCard = document.getElementById(`note-${noteId}`);
-            
+
             noteCard.innerHTML = `
                 <input type="text" id="edit-title-${noteId}" value="${title}" />
                 <textarea id="edit-content-${noteId}">${content}</textarea>
@@ -509,15 +651,12 @@
             }
 
             try {
-                const response = await fetch(`${API_ENDPOINT}/notes/${currentUserId}/${noteId}`, {
+                const response = await authFetch(`${BASE_URL}/notes/${noteId}`, {
                     method: 'PUT',
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({
-                        title: title,
-                        content: content
-                    })
+                    body: JSON.stringify({ title, content })
                 });
 
                 if (!response.ok) {
@@ -527,6 +666,7 @@
                 showStatus('Note updated successfully!', 'success');
                 loadNotes();
             } catch (error) {
+                if (error.message === 'Session expired' || error.message === 'Not authenticated') return;
                 console.error('Error updating note:', error);
                 showStatus(`Error updating note: ${error.message}`, 'error');
             }
@@ -538,7 +678,7 @@
             }
 
             try {
-                const response = await fetch(`${API_ENDPOINT}/notes/${currentUserId}/${noteId}`, {
+                const response = await authFetch(`${BASE_URL}/notes/${noteId}`, {
                     method: 'DELETE'
                 });
 
@@ -549,6 +689,7 @@
                 showStatus('Note deleted successfully!', 'success');
                 loadNotes();
             } catch (error) {
+                if (error.message === 'Session expired' || error.message === 'Not authenticated') return;
                 console.error('Error deleting note:', error);
                 showStatus(`Error deleting note: ${error.message}`, 'error');
             }

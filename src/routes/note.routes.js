@@ -3,13 +3,18 @@ const config = require('../config');
 const { validateNote } = require('../validators/note.validator');
 const noteService = require('../services/note.service');
 const { writeLimiter } = require('../middleware/rateLimiter');
+const { authenticate } = require('../middleware/auth');
 
 const router = express.Router();
+
+// All note routes require authentication
+router.use(authenticate);
 
 // Create note (write-limited)
 router.post('/', writeLimiter, async (req, res) => {
   try {
-    const { userId, title, content } = req.body;
+    const userId = req.user.userId;
+    const { title, content } = req.body;
 
     const validation = validateNote({ userId, title, content });
     if (!validation.valid) {
@@ -32,14 +37,10 @@ router.post('/', writeLimiter, async (req, res) => {
   }
 });
 
-// Get all notes for a user (only non-deleted)
-router.get('/:userId', async (req, res) => {
+// Get all notes for authenticated user (only non-deleted)
+router.get('/', async (req, res) => {
   try {
-    const { userId } = req.params;
-
-    if (!userId || userId.trim() === '') {
-      return res.status(400).json({ error: 'userId is required' });
-    }
+    const userId = req.user.userId;
 
     const notes = await noteService.getNotesByUser(userId);
 
@@ -58,9 +59,10 @@ router.get('/:userId', async (req, res) => {
 });
 
 // Get single note (returns 404 for soft-deleted notes)
-router.get('/:userId/:noteId', async (req, res) => {
+router.get('/:noteId', async (req, res) => {
   try {
-    const { userId, noteId } = req.params;
+    const userId = req.user.userId;
+    const { noteId } = req.params;
 
     const note = await noteService.getNote(userId, noteId);
 
@@ -79,9 +81,10 @@ router.get('/:userId/:noteId', async (req, res) => {
 });
 
 // Update note (write-limited, cannot update soft-deleted notes)
-router.put('/:userId/:noteId', writeLimiter, async (req, res) => {
+router.put('/:noteId', writeLimiter, async (req, res) => {
   try {
-    const { userId, noteId } = req.params;
+    const userId = req.user.userId;
+    const { noteId } = req.params;
     const { title, content } = req.body;
 
     if (!title || !content) {
@@ -113,9 +116,10 @@ router.put('/:userId/:noteId', writeLimiter, async (req, res) => {
 });
 
 // Soft-delete note (write-limited)
-router.delete('/:userId/:noteId', writeLimiter, async (req, res) => {
+router.delete('/:noteId', writeLimiter, async (req, res) => {
   try {
-    const { userId, noteId } = req.params;
+    const userId = req.user.userId;
+    const { noteId } = req.params;
 
     const deletedNote = await noteService.deleteNote(userId, noteId);
 
