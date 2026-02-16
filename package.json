@@ -7,9 +7,9 @@
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "test": "jest --coverage --verbose",
-    "test:unit": "jest tests/unit --coverage",
-    "test:integration": "jest tests/integration --coverage",
-    "test:e2e": "jest tests/e2e --coverage --runInBand",
+    "test:unit": "jest tests/unit",
+    "test:integration": "jest tests/integration",
+    "test:e2e": "jest tests/e2e --runInBand",
     "test:watch": "jest --watch",
     "lint": "eslint src tests",
     "lint:fix": "eslint src tests --fix"
