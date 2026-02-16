@@ -164,6 +164,18 @@ function createApp() {
     });
   });
 
+
+// Version endpoint (ADD THIS NEW CODE)
+  app.get('/version', (req, res) => {
+    res.json({
+      version: '1.0.0',
+      name: 'Notes API',
+      description: 'Simple note-taking API',
+      author: 'Your Name'
+    });
+  });
+
+
   // Create note
   app.post('/notes', async (req, res) => {
     try {
