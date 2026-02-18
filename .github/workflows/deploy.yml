@@ -96,8 +96,8 @@ jobs:
           IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
         run: |
           docker build -t $ECR_REPO:$IMAGE_TAG -t $ECR_REPO:latest .
-          docker push $ECR_REPO:$IMAGE_TAG
-          docker push $ECR_REPO:latest
+          docker push $ECR_REPO:$IMAGE_TAG || echo "Tag already exists, skipping"
+          docker push $ECR_REPO:latest || echo "Latest tag push failed, skipping"
           echo "Pushed $ECR_REPO:$IMAGE_TAG"
 
       - name: Build and push Worker image
@@ -108,8 +108,8 @@ jobs:
         run: |
           # Worker uses the same Dockerfile (same Node.js app, different entry command)
           docker build -t $ECR_REPO:$IMAGE_TAG -t $ECR_REPO:latest .
-          docker push $ECR_REPO:$IMAGE_TAG
-          docker push $ECR_REPO:latest
+          docker push $ECR_REPO:$IMAGE_TAG || echo "Tag already exists, skipping"
+          docker push $ECR_REPO:latest || echo "Latest tag push failed, skipping"
           echo "Pushed $ECR_REPO:$IMAGE_TAG"
 
   # ------------------------------------------------------------------
