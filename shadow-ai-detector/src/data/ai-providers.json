@@ -1,0 +1,209 @@
+{
+  "providers": [
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "category": "general_llm",
+      "riskTier": "high",
+      "domains": [
+        "api.openai.com",
+        "chatgpt.com",
+        "chat.openai.com",
+        "platform.openai.com"
+      ],
+      "sniPatterns": ["*.openai.com", "*.chatgpt.com"]
+    },
+    {
+      "id": "anthropic",
+      "name": "Anthropic",
+      "category": "general_llm",
+      "riskTier": "high",
+      "domains": [
+        "api.anthropic.com",
+        "claude.ai",
+        "console.anthropic.com"
+      ],
+      "sniPatterns": ["*.anthropic.com", "*.claude.ai"]
+    },
+    {
+      "id": "google-ai",
+      "name": "Google AI (Gemini)",
+      "category": "general_llm",
+      "riskTier": "high",
+      "domains": [
+        "generativelanguage.googleapis.com",
+        "aistudio.google.com",
+        "gemini.google.com"
+      ],
+      "sniPatterns": ["generativelanguage.googleapis.com"]
+    },
+    {
+      "id": "azure-openai",
+      "name": "Azure OpenAI",
+      "category": "general_llm",
+      "riskTier": "high",
+      "domains": [
+        "*.openai.azure.com",
+        "*.cognitiveservices.azure.com"
+      ],
+      "sniPatterns": ["*.openai.azure.com"]
+    },
+    {
+      "id": "aws-bedrock",
+      "name": "AWS Bedrock",
+      "category": "general_llm",
+      "riskTier": "medium",
+      "domains": [
+        "bedrock-runtime.*.amazonaws.com",
+        "bedrock.*.amazonaws.com"
+      ],
+      "sniPatterns": ["bedrock-runtime.*.amazonaws.com"]
+    },
+    {
+      "id": "cohere",
+      "name": "Cohere",
+      "category": "general_llm",
+      "riskTier": "medium",
+      "domains": [
+        "api.cohere.ai",
+        "api.cohere.com",
+        "dashboard.cohere.com"
+      ],
+      "sniPatterns": ["*.cohere.ai", "*.cohere.com"]
+    },
+    {
+      "id": "mistral",
+      "name": "Mistral AI",
+      "category": "general_llm",
+      "riskTier": "medium",
+      "domains": [
+        "api.mistral.ai",
+        "chat.mistral.ai",
+        "console.mistral.ai"
+      ],
+      "sniPatterns": ["*.mistral.ai"]
+    },
+    {
+      "id": "huggingface",
+      "name": "Hugging Face",
+      "category": "model_hosting",
+      "riskTier": "medium",
+      "domains": [
+        "api-inference.huggingface.co",
+        "huggingface.co",
+        "*.endpoints.huggingface.cloud"
+      ],
+      "sniPatterns": ["*.huggingface.co", "*.huggingface.cloud"]
+    },
+    {
+      "id": "replicate",
+      "name": "Replicate",
+      "category": "model_hosting",
+      "riskTier": "medium",
+      "domains": [
+        "api.replicate.com",
+        "replicate.com"
+      ],
+      "sniPatterns": ["*.replicate.com"]
+    },
+    {
+      "id": "perplexity",
+      "name": "Perplexity AI",
+      "category": "search_llm",
+      "riskTier": "medium",
+      "domains": [
+        "api.perplexity.ai",
+        "perplexity.ai"
+      ],
+      "sniPatterns": ["*.perplexity.ai"]
+    },
+    {
+      "id": "groq",
+      "name": "Groq",
+      "category": "inference",
+      "riskTier": "medium",
+      "domains": [
+        "api.groq.com",
+        "console.groq.com"
+      ],
+      "sniPatterns": ["*.groq.com"]
+    },
+    {
+      "id": "together-ai",
+      "name": "Together AI",
+      "category": "inference",
+      "riskTier": "medium",
+      "domains": [
+        "api.together.xyz",
+        "together.ai"
+      ],
+      "sniPatterns": ["*.together.xyz", "*.together.ai"]
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "category": "general_llm",
+      "riskTier": "high",
+      "domains": [
+        "api.deepseek.com",
+        "chat.deepseek.com"
+      ],
+      "sniPatterns": ["*.deepseek.com"]
+    },
+    {
+      "id": "stability-ai",
+      "name": "Stability AI",
+      "category": "image_generation",
+      "riskTier": "medium",
+      "domains": [
+        "api.stability.ai",
+        "platform.stability.ai"
+      ],
+      "sniPatterns": ["*.stability.ai"]
+    },
+    {
+      "id": "midjourney",
+      "name": "Midjourney",
+      "category": "image_generation",
+      "riskTier": "medium",
+      "domains": [
+        "api.midjourney.com",
+        "midjourney.com"
+      ],
+      "sniPatterns": ["*.midjourney.com"]
+    },
+    {
+      "id": "elevenlabs",
+      "name": "ElevenLabs",
+      "category": "voice_ai",
+      "riskTier": "medium",
+      "domains": [
+        "api.elevenlabs.io",
+        "elevenlabs.io"
+      ],
+      "sniPatterns": ["*.elevenlabs.io"]
+    },
+    {
+      "id": "cursor",
+      "name": "Cursor (AI IDE)",
+      "category": "coding_assistant",
+      "riskTier": "low",
+      "domains": [
+        "api2.cursor.sh",
+        "cursor.sh"
+      ],
+      "sniPatterns": ["*.cursor.sh"]
+    },
+    {
+      "id": "copilot",
+      "name": "GitHub Copilot",
+      "category": "coding_assistant",
+      "riskTier": "low",
+      "domains": [
+        "copilot-proxy.githubusercontent.com",
+        "api.githubcopilot.com"
+      ],
+      "sniPatterns": ["*copilot*"]
+    }
+  ]
+}

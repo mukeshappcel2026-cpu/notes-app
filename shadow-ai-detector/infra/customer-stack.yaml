@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Shadow AI Detector — Customer deployment stack.
+  Sets up DNS Firewall domain list, alert rules, and EventBridge forwarding
+  to your Shadow AI Detector SaaS platform.
+
+Parameters:
+  ShadowAIIngestionEndpoint:
+    Type: String
+    Description: The HTTPS endpoint for your Shadow AI Detector ingestion API
+    AllowedPattern: 'https://.*'
+    ConstraintDescription: Must be a valid HTTPS URL
+
+  ShadowAIApiKey:
+    Type: String
+    Description: Your Shadow AI Detector API key (starts with sad_)
+    NoEcho: true
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC to monitor for shadow AI usage
+
+Resources:
+  # ──────────────────────────────────────────────────────
+  # DNS Firewall: Domain list of known AI providers
+  # ──────────────────────────────────────────────────────
+  AIProviderDomainList:
+    Type: AWS::Route53Resolver::FirewallDomainList
+    Properties:
+      Name: shadow-ai-detector-providers
+      Domains:
+        # OpenAI
+        - api.openai.com
+        - chatgpt.com
+        - chat.openai.com
+        - platform.openai.com
+        # Anthropic
+        - api.anthropic.com
+        - claude.ai
+        - console.anthropic.com
+        # Google AI
+        - generativelanguage.googleapis.com
+        - aistudio.google.com
+        - gemini.google.com
+        # Azure OpenAI (wildcard)
+        - "*.openai.azure.com"
+        # Cohere
+        - api.cohere.ai
+        - api.cohere.com
+        # Mistral
+        - api.mistral.ai
+        - chat.mistral.ai
+        # Hugging Face
+        - api-inference.huggingface.co
+        - "*.endpoints.huggingface.cloud"
+        # Replicate
+        - api.replicate.com
+        # Perplexity
+        - api.perplexity.ai
+        # Groq
+        - api.groq.com
+        # Together AI
+        - api.together.xyz
+        # DeepSeek
+        - api.deepseek.com
+        - chat.deepseek.com
+        # Stability AI
+        - api.stability.ai
+        # ElevenLabs
+        - api.elevenlabs.io
+
+  # ──────────────────────────────────────────────────────
+  # DNS Firewall: Rule group with ALERT action
+  # ──────────────────────────────────────────────────────
+  AIProviderRuleGroup:
+    Type: AWS::Route53Resolver::FirewallRuleGroup
+    Properties:
+      Name: shadow-ai-detector-rules
+
+  AIProviderAlertRule:
+    Type: AWS::Route53Resolver::FirewallRule
+    Properties:
+      FirewallRuleGroupId: !Ref AIProviderRuleGroup
+      FirewallDomainListId: !Ref AIProviderDomainList
+      Priority: 100
+      Action: ALERT
+      Name: alert-on-ai-provider-dns
+
+  # ──────────────────────────────────────────────────────
+  # Associate rule group with the target VPC
+  # ──────────────────────────────────────────────────────
+  RuleGroupAssociation:
+    Type: AWS::Route53Resolver::FirewallRuleGroupAssociation
+    Properties:
+      FirewallRuleGroupId: !Ref AIProviderRuleGroup
+      VpcId: !Ref VpcId
+      Priority: 101
+      Name: shadow-ai-detector-vpc-association
+
+  # ──────────────────────────────────────────────────────
+  # DNS Firewall query log config → CloudWatch Logs
+  # ──────────────────────────────────────────────────────
+  DNSQueryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /shadow-ai-detector/dns-firewall-alerts
+      RetentionInDays: 7
+
+  DNSQueryLogConfig:
+    Type: AWS::Route53Resolver::ResolverQueryLoggingConfig
+    Properties:
+      Name: shadow-ai-detector-dns-logging
+      DestinationArn: !GetAtt DNSQueryLogGroup.Arn
+
+  DNSQueryLogAssociation:
+    Type: AWS::Route53Resolver::ResolverQueryLoggingConfigAssociation
+    Properties:
+      ResolverQueryLoggingConfigId: !Ref DNSQueryLogConfig
+      ResourceId: !Ref VpcId
+
+  # ──────────────────────────────────────────────────────
+  # EventBridge: Forward DNS Firewall alerts to SaaS platform
+  # ──────────────────────────────────────────────────────
+  ForwardingConnection:
+    Type: AWS::Events::Connection
+    Properties:
+      Name: shadow-ai-detector-connection
+      AuthorizationType: API_KEY
+      AuthParameters:
+        ApiKeyAuthParameters:
+          ApiKeyName: X-API-Key
+          ApiKeyValue: !Ref ShadowAIApiKey
+
+  ForwardingDestination:
+    Type: AWS::Events::ApiDestination
+    Properties:
+      Name: shadow-ai-detector-destination
+      ConnectionArn: !GetAtt ForwardingConnection.Arn
+      HttpMethod: POST
+      InvocationEndpoint: !Sub '${ShadowAIIngestionEndpoint}/api/v1/ingest/eventbridge'
+      InvocationRateLimitPerSecond: 50
+
+  ForwardingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: shadow-ai-detector-forward-alerts
+      Description: Forward DNS Firewall ALERT events to Shadow AI Detector
+      EventPattern:
+        source:
+          - aws.route53resolver
+        detail-type:
+          - DNS Firewall Alert
+        detail:
+          firewall-rule-action:
+            - ALERT
+      Targets:
+        - Id: shadow-ai-detector-saas
+          Arn: !GetAtt ForwardingDestination.Arn
+          RoleArn: !GetAtt EventBridgeForwardingRole.Arn
+
+  EventBridgeForwardingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: shadow-ai-detector-eventbridge-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeApiDestination
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:InvokeApiDestination
+                Resource: !GetAtt ForwardingDestination.Arn
+
+Outputs:
+  DomainListId:
+    Description: DNS Firewall domain list ID
+    Value: !Ref AIProviderDomainList
+
+  RuleGroupId:
+    Description: DNS Firewall rule group ID
+    Value: !Ref AIProviderRuleGroup
+
+  LogGroupName:
+    Description: CloudWatch log group for DNS alerts
+    Value: !Ref DNSQueryLogGroup
+
+  Status:
+    Description: Deployment status
+    Value: !Sub 'Shadow AI Detector monitoring active on VPC ${VpcId}'

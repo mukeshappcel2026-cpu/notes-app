@@ -1,0 +1,40 @@
+{
+  "name": "shadow-ai-detector",
+  "version": "1.0.0",
+  "description": "Shadow AI Detection-as-a-Service — detect unauthorized AI API usage in your cloud environment",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "test": "jest --coverage",
+    "test:unit": "jest tests/unit",
+    "test:e2e": "jest tests/e2e",
+    "lint": "eslint src/ tests/"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
+    "aws-sdk": "^2.1450.0",
+    "uuid": "^9.0.0",
+    "dotenv": "^17.3.1",
+    "express-rate-limit": "^7.5.1"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^6.3.3",
+    "aws-sdk-mock": "^5.9.0",
+    "nodemon": "^3.0.1",
+    "eslint": "^8.50.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "coverageThreshold": {
+      "global": {
+        "branches": 70,
+        "functions": 70,
+        "lines": 70,
+        "statements": 70
+      }
+    }
+  }
+}
