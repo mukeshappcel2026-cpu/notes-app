@@ -9,6 +9,8 @@ const ingestionRoutes = require('./routes/ingestion.routes');
 const findingsRoutes = require('./routes/findings.routes');
 const registryRoutes = require('./routes/registry.routes');
 const allowlistRoutes = require('./routes/allowlist.routes');
+const enrichmentRoutes = require('./routes/enrichment.routes');
+const groupsRoutes = require('./routes/groups.routes');
 
 const app = express();
 
@@ -23,6 +25,8 @@ app.use('/api/v1/ingest', tenantAuth, ingestionRoutes);
 app.use('/api/v1/findings', tenantAuth, findingsRoutes);
 app.use('/api/v1/registry', tenantAuth, registryRoutes);
 app.use('/api/v1/allowlist', tenantAuth, allowlistRoutes);
+app.use('/api/v1/enrichment', tenantAuth, enrichmentRoutes);
+app.use('/api/v1/groups', tenantAuth, groupsRoutes);
 
 app.use(errorHandler);
 

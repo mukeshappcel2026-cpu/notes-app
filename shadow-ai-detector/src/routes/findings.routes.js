@@ -5,10 +5,12 @@ const findingsService = require('../services/findings.service');
 // GET /api/v1/findings
 router.get('/', async (req, res, next) => {
   try {
-    const { status, providerId, limit, cursor } = req.query;
+    const { status, providerId, team, serviceName, limit, cursor } = req.query;
     const result = await findingsService.getFindings(req.tenantId, {
       status,
       providerId,
+      team,
+      serviceName,
       limit: limit ? parseInt(limit, 10) : 50,
       lastKey: cursor,
     });

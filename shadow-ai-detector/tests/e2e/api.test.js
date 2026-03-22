@@ -105,4 +105,45 @@ describe('Shadow AI Detector API', () => {
       expect(res.status).toBe(400);
     });
   });
+
+  describe('Enrichment endpoint validation', () => {
+    it('POST /api/v1/enrichment/catalog rejects missing fields', async () => {
+      const res = await request(app)
+        .post('/api/v1/enrichment/catalog')
+        .set('X-Tenant-Id', 'test-tenant')
+        .send({ ipOrCidr: '10.0.5.42' }); // missing serviceName
+      expect(res.status).toBe(400);
+    });
+
+    it('POST /api/v1/enrichment/catalog/bulk rejects non-array', async () => {
+      const res = await request(app)
+        .post('/api/v1/enrichment/catalog/bulk')
+        .set('X-Tenant-Id', 'test-tenant')
+        .send({ entries: 'not-an-array' });
+      expect(res.status).toBe(400);
+    });
+
+    it('POST /api/v1/enrichment/catalog/bulk rejects oversized batch', async () => {
+      const entries = Array.from({ length: 501 }, (_, i) => ({
+        ipOrCidr: `10.0.0.${i}`,
+        serviceName: `svc-${i}`,
+      }));
+      const res = await request(app)
+        .post('/api/v1/enrichment/catalog/bulk')
+        .set('X-Tenant-Id', 'test-tenant')
+        .send({ entries });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('Maximum 500');
+    });
+  });
+
+  describe('Groups endpoint validation', () => {
+    it('POST /api/v1/groups/:key/acknowledge rejects missing acknowledgedBy', async () => {
+      const res = await request(app)
+        .post('/api/v1/groups/10.0.5.42%3A%3Aopenai/acknowledge')
+        .set('X-Tenant-Id', 'test-tenant')
+        .send({});
+      expect(res.status).toBe(400);
+    });
+  });
 });

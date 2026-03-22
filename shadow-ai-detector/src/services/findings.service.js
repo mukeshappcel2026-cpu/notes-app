@@ -31,7 +31,7 @@ async function createFinding(tenantId, finding) {
     sourceEniId: finding.sourceEniId || null,
 
     // Detection info (what was detected)
-    detectionMethod: finding.detectionMethod, // 'dns_firewall', 'nw_firewall_sni', 'flow_log'
+    detectionMethod: finding.detectionMethod,
     queryName: finding.queryName || null,
     sniValue: finding.sniValue || null,
     destinationIp: finding.destinationIp || null,
@@ -41,6 +41,14 @@ async function createFinding(tenantId, finding) {
     providerName: finding.providerName,
     riskTier: finding.riskTier,
     category: finding.category,
+
+    // Enrichment / attribution
+    instanceId: finding.instanceId || null,
+    instanceName: finding.instanceName || null,
+    serviceName: finding.serviceName || null,
+    team: finding.team || null,
+    environment: finding.environment || null,
+    enrichmentSource: finding.enrichmentSource || 'none',
 
     // Timestamps
     detectedAt: finding.detectedAt || now,
@@ -53,7 +61,7 @@ async function createFinding(tenantId, finding) {
   return item;
 }
 
-async function getFindings(tenantId, { status, providerId, limit = 50, lastKey } = {}) {
+async function getFindings(tenantId, { status, providerId, team, serviceName, limit = 50, lastKey } = {}) {
   const db = getDocClient();
   const params = {
     TableName: config.tables.findings,
@@ -62,22 +70,35 @@ async function getFindings(tenantId, { status, providerId, limit = 50, lastKey }
       ':pk': `TENANT#${tenantId}`,
       ':prefix': 'FINDING#',
     },
-    ScanIndexForward: false, // newest first
+    ScanIndexForward: false,
     Limit: limit,
   };
 
   const filters = [];
+  const exprNames = {};
+
   if (status) {
     filters.push('#status = :status');
     params.ExpressionAttributeValues[':status'] = status;
-    params.ExpressionAttributeNames = { ...params.ExpressionAttributeNames, '#status': 'status' };
+    exprNames['#status'] = 'status';
   }
   if (providerId) {
     filters.push('providerId = :providerId');
     params.ExpressionAttributeValues[':providerId'] = providerId;
   }
+  if (team) {
+    filters.push('team = :team');
+    params.ExpressionAttributeValues[':team'] = team;
+  }
+  if (serviceName) {
+    filters.push('serviceName = :serviceName');
+    params.ExpressionAttributeValues[':serviceName'] = serviceName;
+  }
   if (filters.length > 0) {
     params.FilterExpression = filters.join(' AND ');
+  }
+  if (Object.keys(exprNames).length > 0) {
+    params.ExpressionAttributeNames = exprNames;
   }
   if (lastKey) {
     params.ExclusiveStartKey = JSON.parse(Buffer.from(lastKey, 'base64').toString());
@@ -96,7 +117,6 @@ async function getFindings(tenantId, { status, providerId, limit = 50, lastKey }
 async function acknowledgeFinding(tenantId, findingId, acknowledgedBy) {
   const db = getDocClient();
 
-  // Find the exact SK first
   const query = await db.query({
     TableName: config.tables.findings,
     KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
@@ -151,6 +171,8 @@ async function getFindingStats(tenantId) {
     byProvider: {},
     byRiskTier: { high: 0, medium: 0, low: 0 },
     byDetectionMethod: {},
+    byTeam: {},
+    byService: {},
     uniqueSourceIps: new Set(),
   };
 
@@ -159,6 +181,8 @@ async function getFindingStats(tenantId) {
     stats.byProvider[item.providerName] = (stats.byProvider[item.providerName] || 0) + 1;
     stats.byRiskTier[item.riskTier] = (stats.byRiskTier[item.riskTier] || 0) + 1;
     stats.byDetectionMethod[item.detectionMethod] = (stats.byDetectionMethod[item.detectionMethod] || 0) + 1;
+    if (item.team) stats.byTeam[item.team] = (stats.byTeam[item.team] || 0) + 1;
+    if (item.serviceName) stats.byService[item.serviceName] = (stats.byService[item.serviceName] || 0) + 1;
     if (item.sourceIp) stats.uniqueSourceIps.add(item.sourceIp);
   }
 
