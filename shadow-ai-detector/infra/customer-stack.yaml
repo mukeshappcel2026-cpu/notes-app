@@ -98,27 +98,6 @@ Resources:
       Name: shadow-ai-detector-vpc-association
 
   # ──────────────────────────────────────────────────────
-  # DNS Firewall query log config → CloudWatch Logs
-  # ──────────────────────────────────────────────────────
-  DNSQueryLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: /shadow-ai-detector/dns-firewall-alerts
-      RetentionInDays: 7
-
-  DNSQueryLogConfig:
-    Type: AWS::Route53Resolver::ResolverQueryLoggingConfig
-    Properties:
-      Name: shadow-ai-detector-dns-logging
-      DestinationArn: !GetAtt DNSQueryLogGroup.Arn
-
-  DNSQueryLogAssociation:
-    Type: AWS::Route53Resolver::ResolverQueryLoggingConfigAssociation
-    Properties:
-      ResolverQueryLoggingConfigId: !Ref DNSQueryLogConfig
-      ResourceId: !Ref VpcId
-
-  # ──────────────────────────────────────────────────────
   # EventBridge: Forward DNS Firewall alerts to SaaS platform
   # ──────────────────────────────────────────────────────
   ForwardingConnection:
@@ -186,10 +165,6 @@ Outputs:
   RuleGroupId:
     Description: DNS Firewall rule group ID
     Value: !Ref AIProviderRuleGroup
-
-  LogGroupName:
-    Description: CloudWatch log group for DNS alerts
-    Value: !Ref DNSQueryLogGroup
 
   Status:
     Description: Deployment status
