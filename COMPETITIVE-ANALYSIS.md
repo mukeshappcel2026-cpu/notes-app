@@ -200,32 +200,61 @@ The AI security market is undergoing rapid consolidation. In the past 18 months,
 
 ---
 
-### 5. Other Players
+### 5. Grip Security — Identity-First SaaS + AI
 
-#### CrowdStrike (Charlotte AI + Falcon)
-- Cloud security with some AI asset discovery
-- Focused on threat detection, not AI inventory
-- **Gap:** No dedicated AI-BOM or shadow AI discovery product
+**What they are:** Identity-centric SaaS security platform. $66M total funding ($41M Series B, Aug 2023, led by Third Point Ventures). ~147 employees. Independent.
 
-#### Orca Security
-- Cloud security with AI-SPM features
-- Similar scope to Wiz (cloud-only)
-- **Gap:** Same cloud-only limitations as Wiz; smaller market share
+**What they offer:**
+- Identity-first SaaS + AI discovery (analyzes email flows, browser activity, IdP/SSO data)
+- Shadow AI detection: discovers AI tools, flags AI features embedded in approved SaaS
+- AI agent mapping, access control, policy enforcement
+- Agentless deployment — no network changes
+- License optimization and cost management
+- Browser extension for user behavior insights
 
-#### SentinelOne (+ Prompt Security)
-- Acquired Prompt Security (Aug 2025) for GenAI security
-- Purple AI for threat hunting
-- **Gap:** Prompt Security was about prompt injection/guardrails, not AI inventory
+**Key stat:** Their research found 91% of AI tools are unmanaged; average enterprise operates 3,891 SaaS+AI environments; 96% show ChatGPT presence despite bans.
 
-#### Check Point (+ Lakera)
-- Acquired Lakera (Sep 2025) for AI security
-- Integrated into Infinity Platform, CloudGuard WAF
-- **Gap:** Lakera was prompt injection defense, not AI discovery/BOM
+**Threat level: MEDIUM** — Similar SaaS-first approach as Reco but smaller and less AI-focused. Identity angle is interesting but doesn't extend to network/code/cloud billing.
 
-#### HiddenLayer (Independent)
-- ML model security: adversarial attack detection, model scanning (35+ formats)
-- $50M Series A led by Microsoft M12
-- **Gap:** Model security only, no discovery or inventory capabilities
+---
+
+### 6. Other Players
+
+#### HiddenLayer (Independent — $56M funding)
+- **Most comprehensive independent AI security company remaining**
+- AISec Platform 2.0 (April 2025): AI Discovery, Supply Chain Security, Attack Simulation, Runtime Security, Model Genealogy, AI-BOM
+- $50M Series A led by Microsoft M12; investors include IBM Ventures, Capital One Ventures
+- ~164 employees. Strong government/defense foothold (MDA SHIELD contract with $151B ceiling)
+- Gartner Cool Vendor for AI Security
+- **Gap:** Enterprise/government focused; no SaaS shadow AI discovery or network-level detection; expensive
+
+#### Orca Security (Independent — $640M funding, $1.8B valuation)
+- Cloud CNAPP with AI-SPM add-on. Agentless SideScanning for AI model discovery
+- Covers Azure OpenAI, Bedrock, SageMaker, Vertex AI, 50+ AI packages
+- Acquired Opus (May 2025) for agentic AI remediation
+- **Gap:** Same cloud-only limitations as Wiz; smaller market share; AI-SPM is a feature, not the product
+
+#### CrowdStrike (Public — acquired SGNL for $740M, Pangea, Onum)
+- Building agentic AI security capabilities through acquisitions
+- Charlotte AI for threat hunting
+- **Gap:** No dedicated AI-BOM or shadow AI discovery product; focused on threat detection
+
+#### SentinelOne (+ Prompt Security acquisition)
+- Acquired Prompt Security (Aug 2025) — GenAI runtime security, prompt injection defense, data leak protection
+- Prompt Security had transparent pricing: $120 per 1,000 requests/year
+- **Gap:** Prompt Security was guardrails, not discovery/inventory. Integration ongoing
+
+#### Check Point (+ Lakera acquisition)
+- Acquired Lakera (Nov 2025) — forming Global Center of Excellence for AI Security in Zurich
+- Lakera Guard: 98%+ prompt injection detection, sub-50ms latency, 100+ languages
+- Gandalf game generated 80M+ adversarial prompts for threat intelligence
+- **Gap:** Lakera was prompt injection defense, not AI discovery/BOM. Integration into Infinity Platform ongoing
+
+#### F5 (+ CalypsoAI acquisition — $180M)
+- Acquired CalypsoAI (Sep 2025) — inference-layer AI security
+- AI-agent-driven red teaming, real-time guardrails, usage monitoring
+- Strong government/defense customer base (Lockheed Martin investor)
+- **Gap:** Inference-only focus; no discovery or inventory capabilities
 
 #### Snyk
 - Developer security with some AI-BOM thought leadership
@@ -234,6 +263,22 @@ The AI security market is undergoing rapid consolidation. In the past 18 months,
 ---
 
 ## Competitive Positioning Matrix
+
+### Funding & Status Summary
+
+| Company | Status | Funding | Focus |
+|---|---|---|---|
+| **Wiz** | Acquired (Google, $32B) | $1.9B+ | Cloud AI-SPM (CNAPP feature) |
+| **Palo Alto Networks** | Public ($120B+ mktcap) | N/A | Full AI security platform (Prisma AIRS) |
+| **Cisco** | Public | N/A | Network-level AI defense |
+| **Reco** | Independent | $85M | SaaS + shadow AI discovery |
+| **Grip Security** | Independent | $66M | Identity-first SaaS + AI |
+| **HiddenLayer** | Independent | $56M | Full AI lifecycle security |
+| **Orca Security** | Independent | $640M | Cloud CNAPP + AI-SPM |
+| **CrowdStrike** | Public | N/A | Threat detection + agentic AI |
+| **SentinelOne** | Public (+ Prompt Security) | N/A | Endpoint + GenAI guardrails |
+| **Check Point** | Public (+ Lakera) | N/A | Network + prompt injection |
+| **F5** | Public (+ CalypsoAI, $180M) | N/A | Inference-layer AI security |
 
 ```
                     AI INVENTORY/DISCOVERY BREADTH
@@ -249,11 +294,11 @@ The AI security market is undergoing rapid consolidation. In the past 18 months,
     U    ├────────────────────┼─────────────────────────┤
     R    │                    │                         │
     I    │   HiddenLayer      │      Reco               │
-    T    │   PAN/Protect AI   │                         │
+    T    │   PAN/Protect AI   │      Grip               │
     Y    │   Cisco/Robust Int │                         │
          │   SentinelOne      │                         │
     D    │   Check Point      │                         │
-    E    │                    │                         │
+    E    │   F5/CalypsoAI     │                         │
     P    │                    │                         │
     T    │                    │                         │
     H    │                    │                         │
@@ -343,3 +388,19 @@ Every competitor approaches AI security from their existing lens:
 - [Menlo Ventures: Security for AI Startup Landscape](https://menlovc.com/perspective/security-for-ai-genai-risks-and-the-emerging-startup-landscape/)
 - [AI-SPM Market Report (QY Research)](https://www.qyresearch.com/reports/4408663/ai-security-posture-management--ai-spm)
 - [SPM Market Size (MarketsandMarkets)](https://www.marketsandmarkets.com/PressReleases/security-posture-management-spm.asp)
+- [Grip Security — AI Security](https://www.grip.security/ai-security)
+- [Grip Security — Series B](https://www.grip.security/press-release/grip-security-raising-41-million-series-b-led-by-third-point-ventures)
+- [HiddenLayer AISec Platform 2.0](https://hiddenlayer.com/innovation-hub/hiddenlayer-unveils-aisec-platform-2-0-to-deliver-unmatched-context-visibility-and-observability-for-enterprise-ai-security/)
+- [HiddenLayer 2026 AI Threat Report](https://www.prnewswire.com/news-releases/hiddenlayer-releases-the-2026-ai-threat-landscape-report-spotlighting-the-rise-of-agentic-ai-and-the-expanding-attack-surface-of-autonomous-systems-302716687.html)
+- [F5 Acquires CalypsoAI ($180M)](https://www.geekwire.com/2025/f5-paying-180m-to-acquire-calypsoai-to-boost-ai-enterprise-security-offerings/)
+- [Orca Security AI-SPM](https://orca.security/platform/ai-security-posture-management/)
+- [Orca Acquires Opus](https://orca.security/resources/blog/orca-security-acquires-opus-agentic-ai-cnapp/)
+- [PAN Prisma AIRS Launch](https://www.paloaltonetworks.com/company/press/2025/palo-alto-networks-introduces-prisma-airs--the-foundation-on-which-ai-security-thrives)
+- [PAN Prisma AIRS 2.0](https://www.paloaltonetworks.com/blog/2025/10/prisma-airs-powering-secure-ai-innovation/)
+- [Gartner AI Governance Platforms Market](https://www.gartner.com/en/newsroom/press-releases/2026-02-17-gartner-global-ai-regulations-fuel-billion-dollar-market-for-ai-governance-platforms)
+- [Gartner Top Cybersecurity Trends 2026](https://www.gartner.com/en/newsroom/press-releases/2026-02-05-gartner-identifies-the-top-cybersecurity-trends-for-2026)
+- [EU AI Act Compliance Deadlines](https://www.legalnodes.com/article/eu-ai-act-2026-updates-compliance-requirements-and-business-risks)
+- [Cybersecurity M&A Hit $102B in 2025](https://www.hsfkramer.com/insights/reports/2026/global-ma-report-2026/sector-perspectives/cybersecurity)
+- [AI Security VC Funding 2025 ($8.5B)](https://softwarestrategiesblog.com/2025/12/30/ai-security-startups-funding-2025/)
+- [Cybersecurity Startup Investment 2025](https://news.crunchbase.com/venture/cybersecurity-startup-investment-up-ye-2025/)
+- [Knostic — Shadow AI Detection Tools](https://www.knostic.ai/blog/shadow-ai-detection-tools)
