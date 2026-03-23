@@ -64,23 +64,40 @@ The AI security market is undergoing rapid consolidation. In the past 18 months,
 
 ### 1. Wiz AI-SPM — The Primary Threat
 
-**What they are:** Cloud security platform (CNAPP), valued at $12B+, acquired by Google for $32B (announced 2025). Named Leader with Highest Current Offering Score in Forrester Wave CNAPP Q1 2026.
+**What they are:** Cloud security platform (CNAPP), acquired by Google for **$32B** (completed March 2026). Named Leader with Highest Current Offering Score in Forrester Wave CNAPP Q1 2026. **40% of Fortune 100** use Wiz. Scaled from $1M to $100M ARR in 18 months.
 
-**AI-SPM Launch:** November 2023 — first CNAPP to include AI-SPM. Significantly expanded at Wizdom 2025 (November 2025).
+**AI-SPM Timeline:**
+- **Nov 2023** — launched AI-SPM (first CNAPP to do so)
+- **Jan 2024** — OpenAI SaaS connector (first CNAPP for OpenAI customers)
+- **May 2024** — model scanning for self-hosted models
+- **Nov 2025 (Wizdom 2025)** — major expansion: AI agent discovery, MCP discovery, Agent Inventory View
+- **Mar 2026** — Google acquisition completed; confirmed multi-cloud commitment
 
 **What they do well:**
 
 | Capability | Details |
 |---|---|
-| **AI-BOM** | Agentless discovery of AI services, models, SDKs, libraries, dependencies across cloud |
-| **Agent Inventory** | Visualizes agents, models, tools, MCP connections, data (training + knowledge base) |
-| **Attack Surface Mapping** | Maps external-facing AI endpoints → workloads → owners via Security Graph |
-| **Misconfiguration Detection** | Built-in rules for SageMaker, Vertex AI, Bedrock, Azure OpenAI misconfigs |
-| **DSPM for AI** | Detects sensitive training data, flags data leakage risks |
-| **Attack Path Analysis** | Links vulnerabilities, identities, network exposure, secrets to AI models |
+| **AI-BOM** | Agentless discovery of AI services, models, SDKs, libraries, dependencies across cloud. Flags as approved/unwanted/unreviewed |
+| **Agent Inventory** | Visualizes agents, models, tools, MCP connections, data (training + knowledge base). Contextualizes blast radius per agent |
+| **Attack Surface Mapping** | Maps external-facing AI endpoints → workloads → owners via Security Graph. Dynamic scanner validates live exposure |
+| **Misconfiguration Detection** | Built-in rules for SageMaker, Vertex AI, Bedrock, Azure OpenAI misconfigs. IaC scanning extension |
+| **DSPM for AI** | Detects sensitive training data, flags data leakage risks, proactively removes attack paths to training data |
+| **Attack Path Analysis** | Links vulnerabilities, identities, network exposure, secrets to AI models. "Toxic combination" detection |
 | **Runtime Monitoring** | Detects rogue agents, suspicious DNS from AI workloads, drift from baselines |
 | **MCP Discovery** | Discovers Model Context Protocol usage across environments |
-| **OWASP LLM Top 10** | Flags issues mapped to OWASP LLM Top 10 |
+| **Model Scanning** | Scans self-hosted models for malicious content (42% → 75% of orgs now self-host) |
+| **OWASP LLM Top 10** | Built-in policies for prompt injection, data poisoning, insecure output handling |
+| **Mika AI** | Natural language queries against security graph ("Which LLMs have access to production databases?") |
+
+**Architecture:** Graph database (Amazon Neptune) maps all cloud resources, identities, vulnerabilities, AI assets as interconnected nodes. AI-SPM is fully embedded — not a bolt-on.
+
+**Clouds supported:** AWS, Azure, GCP, OCI, Alibaba Cloud, VMware vSphere, Kubernetes, OpenShift.
+
+**AI services detected:** SageMaker, Bedrock, Azure OpenAI, Vertex AI, OpenAI (SaaS), TensorFlow, Hugging Face, LangChain, DeepSeek, Mistral, BERT, Qwen2.
+
+**Pricing:** No public pricing; bundled within CNAPP (not sold separately). Large environments (~3,000 people) report >$100K. Available via AWS Marketplace. No free tier.
+
+**Key stat from Wiz research:** Only **13% of organizations have adopted AI-specific security controls**. 25% don't know what AI services are running in their environment.
 
 **What they miss:**
 
@@ -89,11 +106,12 @@ The AI security market is undergoing rapid consolidation. In the past 18 months,
 | **Cloud-only scope** | Zero visibility into SaaS-embedded AI (Notion AI, Slack AI, Salesforce Einstein), browser extensions, individual subscriptions |
 | **No network-level detection** | Can't see DNS calls to `api.openai.com` from on-prem or non-cloud workloads |
 | **No procurement/expense data** | Misses shadow AI purchased via credit cards, expensed individually |
-| **No code dependency scanning** | Doesn't parse `requirements.txt`, `package.json` for AI SDK usage across repos |
-| **Enterprise-only** | Priced for large enterprises with significant cloud footprints; SMB/mid-market gap |
-| **Google acquisition** | Post-acquisition focus may shift to GCP-first; multi-cloud customers may seek alternatives |
+| **No code dependency scanning** | Doesn't parse `requirements.txt`, `package.json` for AI SDK usage across repos (they scan cloud workloads, not git repos) |
+| **Bundled-only pricing** | Must buy full CNAPP; no standalone AI inventory product. Prices out SMB/mid-market |
+| **Google acquisition risk** | Multi-cloud commitment stated but untested long-term; GCP-first incentives are real |
+| **SaaS connector gap** | Only OpenAI and M365 SaaS connectors; no Notion, Slack, Salesforce AI feature detection |
 
-**Threat level: HIGH** — They have the brand, the graph, and the distribution. But their AI-SPM is a feature of their CNAPP, not a standalone product. They'll never care about expense-report-level shadow AI.
+**Threat level: HIGH** — They have the brand, the graph, and the distribution. But their AI-SPM is a feature of their CNAPP, not a standalone product. They'll never care about expense-report-level shadow AI. Their own data says 87% of organizations lack AI-specific security controls — the market is wide open beyond cloud-native orgs.
 
 ---
 
