@@ -52,4 +52,23 @@ router.post('/providers', async (req, res, next) => {
   }
 });
 
+// GET /api/v1/registry/domains
+// Returns flat list of all domains for DNS Firewall sync
+router.get('/domains', async (req, res, next) => {
+  try {
+    const providers = await registryService.getProvidersForTenant(req.tenantId);
+    const domains = [];
+    for (const provider of providers) {
+      if (provider.domains) {
+        domains.push(...provider.domains);
+      }
+    }
+    // Deduplicate
+    const unique = [...new Set(domains)];
+    res.json({ domains: unique, count: unique.length });
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;

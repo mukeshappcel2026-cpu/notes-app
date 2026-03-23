@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Shadow AI Detector — Customer deployment stack.
-  Sets up DNS Firewall domain list, alert rules, and EventBridge forwarding
-  to your Shadow AI Detector SaaS platform.
+  Sets up DNS Firewall domain list, alert rules, EventBridge forwarding,
+  and automatic domain list sync from the SaaS platform.
 
 Parameters:
   ShadowAIIngestionEndpoint:
@@ -20,54 +20,27 @@ Parameters:
     Type: AWS::EC2::VPC::Id
     Description: The VPC to monitor for shadow AI usage
 
+  SyncIntervalMinutes:
+    Type: Number
+    Default: 60
+    MinValue: 15
+    MaxValue: 1440
+    Description: How often (in minutes) to sync the AI provider domain list from the SaaS platform
+
 Resources:
   # ──────────────────────────────────────────────────────
   # DNS Firewall: Domain list of known AI providers
+  # Seeded with initial domains, kept in sync by Lambda
   # ──────────────────────────────────────────────────────
   AIProviderDomainList:
     Type: AWS::Route53Resolver::FirewallDomainList
     Properties:
       Name: shadow-ai-detector-providers
       Domains:
-        # OpenAI
+        # Seed list — replaced automatically by DomainSyncFunction
         - api.openai.com
-        - chatgpt.com
-        - chat.openai.com
-        - platform.openai.com
-        # Anthropic
         - api.anthropic.com
-        - claude.ai
-        - console.anthropic.com
-        # Google AI
         - generativelanguage.googleapis.com
-        - aistudio.google.com
-        - gemini.google.com
-        # Azure OpenAI (wildcard)
-        - "*.openai.azure.com"
-        # Cohere
-        - api.cohere.ai
-        - api.cohere.com
-        # Mistral
-        - api.mistral.ai
-        - chat.mistral.ai
-        # Hugging Face
-        - api-inference.huggingface.co
-        - "*.endpoints.huggingface.cloud"
-        # Replicate
-        - api.replicate.com
-        # Perplexity
-        - api.perplexity.ai
-        # Groq
-        - api.groq.com
-        # Together AI
-        - api.together.xyz
-        # DeepSeek
-        - api.deepseek.com
-        - chat.deepseek.com
-        # Stability AI
-        - api.stability.ai
-        # ElevenLabs
-        - api.elevenlabs.io
 
   # ──────────────────────────────────────────────────────
   # DNS Firewall: Rule group with ALERT action
@@ -96,6 +69,143 @@ Resources:
       VpcId: !Ref VpcId
       Priority: 101
       Name: shadow-ai-detector-vpc-association
+
+  # ──────────────────────────────────────────────────────
+  # Domain Sync: Lambda that pulls latest domains from SaaS
+  # ──────────────────────────────────────────────────────
+  DomainSyncFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: shadow-ai-detector-domain-sync-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: UpdateFirewallDomainList
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - route53resolver:UpdateFirewallDomains
+                  - route53resolver:ListFirewallDomains
+                Resource: !Sub 'arn:aws:route53resolver:${AWS::Region}:${AWS::AccountId}:firewall-domain-list/*'
+
+  DomainSyncFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: shadow-ai-detector-domain-sync
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt DomainSyncFunctionRole.Arn
+      Environment:
+        Variables:
+          SAAS_ENDPOINT: !Ref ShadowAIIngestionEndpoint
+          API_KEY: !Ref ShadowAIApiKey
+          DOMAIN_LIST_ID: !Ref AIProviderDomainList
+      Code:
+        ZipFile: |
+          const https = require('https');
+          const { Route53Resolver } = require('@aws-sdk/client-route53resolver');
+
+          const resolver = new Route53Resolver();
+
+          function fetchDomains(endpoint, apiKey) {
+            const url = new URL(`${endpoint}/api/v1/registry/domains`);
+            const options = {
+              hostname: url.hostname,
+              port: 443,
+              path: url.pathname,
+              method: 'GET',
+              headers: { 'X-API-Key': apiKey },
+            };
+            return new Promise((resolve, reject) => {
+              const req = https.request(options, (res) => {
+                let body = '';
+                res.on('data', (chunk) => { body += chunk; });
+                res.on('end', () => {
+                  if (res.statusCode !== 200) {
+                    return reject(new Error(`HTTP ${res.statusCode}: ${body}`));
+                  }
+                  resolve(JSON.parse(body));
+                });
+              });
+              req.on('error', reject);
+              req.end();
+            });
+          }
+
+          exports.handler = async () => {
+            const { SAAS_ENDPOINT, API_KEY, DOMAIN_LIST_ID } = process.env;
+
+            console.log('Fetching latest domain list from SaaS platform...');
+            const data = await fetchDomains(SAAS_ENDPOINT, API_KEY);
+            const domains = data.domains;
+            console.log(`Received ${domains.length} domains`);
+
+            if (!domains || domains.length === 0) {
+              console.log('No domains returned — skipping update to avoid clearing the list');
+              return { statusCode: 200, body: 'No domains returned, skipped' };
+            }
+
+            // Get current domains to check if update is needed
+            const current = await resolver.listFirewallDomains({
+              FirewallDomainListId: DOMAIN_LIST_ID,
+              MaxResults: 5000,
+            });
+            const currentDomains = (current.Domains || []).sort();
+            const newDomains = [...domains].sort();
+
+            if (JSON.stringify(currentDomains) === JSON.stringify(newDomains)) {
+              console.log('Domain list is already up to date');
+              return { statusCode: 200, body: 'Already up to date' };
+            }
+
+            // Replace entire domain list
+            await resolver.updateFirewallDomains({
+              FirewallDomainListId: DOMAIN_LIST_ID,
+              Operation: 'REPLACE',
+              Domains: domains,
+            });
+
+            console.log(`Updated domain list with ${domains.length} domains`);
+            return { statusCode: 200, body: `Updated ${domains.length} domains` };
+          };
+
+  # Run sync on first deploy via custom resource
+  DomainSyncTrigger:
+    Type: Custom::DomainSync
+    DependsOn: AIProviderDomainList
+    Properties:
+      ServiceToken: !GetAtt DomainSyncFunction.Arn
+
+  # Run sync on a schedule
+  DomainSyncSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: shadow-ai-detector-domain-sync-schedule
+      Description: Periodically sync AI provider domains from SaaS platform
+      ScheduleExpression: !Sub 'rate(${SyncIntervalMinutes} minutes)'
+      State: ENABLED
+      Targets:
+        - Id: domain-sync-lambda
+          Arn: !GetAtt DomainSyncFunction.Arn
+
+  DomainSyncSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DomainSyncFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DomainSyncSchedule.Arn
 
   # ──────────────────────────────────────────────────────
   # EventBridge: Forward DNS Firewall alerts to SaaS platform
@@ -165,6 +275,10 @@ Outputs:
   RuleGroupId:
     Description: DNS Firewall rule group ID
     Value: !Ref AIProviderRuleGroup
+
+  SyncFunctionArn:
+    Description: Domain sync Lambda ARN
+    Value: !GetAtt DomainSyncFunction.Arn
 
   Status:
     Description: Deployment status

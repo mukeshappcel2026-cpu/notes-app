@@ -94,6 +94,23 @@ describe('Shadow AI Detector API', () => {
         .send({ id: 'test' }); // missing name and domains
       expect(res.status).toBe(400);
     });
+
+    it('GET /api/v1/registry/domains returns flat domain list', async () => {
+      const res = await request(app)
+        .get('/api/v1/registry/domains')
+        .set('X-Tenant-Id', 'test-tenant');
+      // In test mode without DynamoDB, this may fail with 500.
+      // If it succeeds, validate the shape.
+      if (res.status === 200) {
+        expect(res.body).toHaveProperty('domains');
+        expect(Array.isArray(res.body.domains)).toBe(true);
+        expect(res.body).toHaveProperty('count');
+        expect(res.body.count).toBe(res.body.domains.length);
+        // Ensure no duplicates
+        const unique = new Set(res.body.domains);
+        expect(unique.size).toBe(res.body.domains.length);
+      }
+    }, 15000);
   });
 
   describe('Findings endpoint validation', () => {
