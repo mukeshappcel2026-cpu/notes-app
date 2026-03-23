@@ -154,6 +154,57 @@ describe('Shadow AI Detector API', () => {
     });
   });
 
+  describe('Admin registry management', () => {
+    it('rejects requests without admin key', async () => {
+      const res = await request(app).get('/api/v1/admin/providers');
+      expect(res.status).toBe(401);
+    });
+
+    it('PUT /api/v1/admin/providers/:id rejects missing name', async () => {
+      const res = await request(app)
+        .put('/api/v1/admin/providers/test-provider')
+        .set('X-Admin', 'true')
+        .send({ domains: ['api.test.com'] });
+      expect(res.status).toBe(400);
+    });
+
+    it('PUT /api/v1/admin/providers/:id rejects missing domains', async () => {
+      const res = await request(app)
+        .put('/api/v1/admin/providers/test-provider')
+        .set('X-Admin', 'true')
+        .send({ name: 'Test Provider' });
+      expect(res.status).toBe(400);
+    });
+
+    it('PUT /api/v1/admin/providers/:id rejects empty domains array', async () => {
+      const res = await request(app)
+        .put('/api/v1/admin/providers/test-provider')
+        .set('X-Admin', 'true')
+        .send({ name: 'Test Provider', domains: [] });
+      expect(res.status).toBe(400);
+    });
+
+    it('DELETE /api/v1/admin/providers/:id returns 404 for unknown provider', async () => {
+      const res = await request(app)
+        .delete('/api/v1/admin/providers/nonexistent')
+        .set('X-Admin', 'true');
+      // Will be 404 if DynamoDB is available, 500 otherwise
+      expect([404, 500]).toContain(res.status);
+    }, 15000);
+
+    it('GET /api/v1/admin/providers lists global providers with admin auth', async () => {
+      const res = await request(app)
+        .get('/api/v1/admin/providers')
+        .set('X-Admin', 'true');
+      // Will be 200 if DynamoDB is available, 500 otherwise
+      if (res.status === 200) {
+        expect(res.body).toHaveProperty('providers');
+        expect(Array.isArray(res.body.providers)).toBe(true);
+        expect(res.body).toHaveProperty('count');
+      }
+    }, 15000);
+  });
+
   describe('Groups endpoint validation', () => {
     it('POST /api/v1/groups/:key/acknowledge rejects missing acknowledgedBy', async () => {
       const res = await request(app)

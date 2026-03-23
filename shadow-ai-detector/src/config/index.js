@@ -15,5 +15,8 @@ module.exports = {
   alerting: {
     slackWebhookUrl: process.env.SLACK_WEBHOOK_URL || '',
   },
+  admin: {
+    apiKey: process.env.ADMIN_API_KEY || '',
+  },
   env: process.env.NODE_ENV || 'development',
 };

@@ -94,6 +94,34 @@ async function getProvidersForTenant(tenantId) {
   return [...global, ...(custom.Items || [])];
 }
 
+function invalidateCache() {
+  registryCache = null;
+  cacheTimestamp = 0;
+}
+
+async function upsertGlobalProvider(provider) {
+  const db = getDocClient();
+  await db.put({
+    TableName: config.tables.registry,
+    Item: {
+      PK: 'PROVIDER',
+      SK: `PROVIDER#${provider.id}`,
+      ...provider,
+      updatedAt: new Date().toISOString(),
+    },
+  }).promise();
+  invalidateCache();
+}
+
+async function deleteGlobalProvider(providerId) {
+  const db = getDocClient();
+  await db.delete({
+    TableName: config.tables.registry,
+    Key: { PK: 'PROVIDER', SK: `PROVIDER#${providerId}` },
+  }).promise();
+  invalidateCache();
+}
+
 function buildDomainLookup(providers) {
   const lookup = new Map();
   for (const provider of providers) {
@@ -134,6 +162,9 @@ module.exports = {
   getProvider,
   addCustomProvider,
   getProvidersForTenant,
+  upsertGlobalProvider,
+  deleteGlobalProvider,
+  invalidateCache,
   buildDomainLookup,
   matchDomain,
 };
