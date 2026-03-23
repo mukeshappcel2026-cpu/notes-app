@@ -14,34 +14,49 @@ The AI security market is undergoing rapid consolidation. In the past 18 months,
 
 ### Market Size
 
-| Segment | 2024 | 2025 | Projected | CAGR |
+| Segment | 2024 | 2025/2026 | Projected | CAGR |
 |---|---|---|---|---|
-| AI in Cybersecurity (broad) | $26.5B | $34.1B | $234.6B by 2032 | 31.7% |
+| AI in Cybersecurity (broad) | $26.5B | $35.4B (2026) | $234.6B by 2032 | 31.7% |
+| AI Governance Platforms | — | $492M (2026, Gartner) | $1B+ by 2030 | 28–36% |
 | AI-SPM (narrow) | $1.0B | — | $1.6B by 2031 | 6.5–18.4% |
 | DSPM | — | $2.1B | $10.4B by 2030 | 38.3% |
 | Security Posture Mgmt (broad) | — | $26.6B | $53.3B by 2030 | 14.9% |
-| InfoSec total (Gartner) | $193B | $213B | $240B by 2026 | 12.5% |
+| InfoSec total (Gartner) | $193B | $213B (2025) | $240B by 2026 | 12.5% |
+
+**Key stat:** Only 13 companies focus specifically on securing AI systems/LLMs/agentic apps, with total funding of just $414M — less than 5% of the $8.5B broader AI security ecosystem (2024–2025).
 
 ### Regulatory Drivers
 
-- **EU AI Act** — compliance deadlines creating urgency for AI inventory and risk classification
-- **NIST AI RMF** — voluntary framework but increasingly referenced in procurement requirements
-- **Gartner** named "AI Security Platforms" a **Top Strategic Technology Trend for 2026**
+- **EU AI Act** — **August 2, 2026 deadline** for full enforcement on high-risk AI systems. Non-compliance penalty: up to **7% of global annual revenue**. Most enterprises face significant compliance gaps.
+- **NIST AI RMF** — voluntary but increasingly referenced by US sector regulators (CFPB, FDA, SEC, FTC, EEOC). Federal contractors must follow NIST-aligned governance. Version 1.1 updates expected in 2026.
+- **Gartner** named "AI Security Platforms" a **Top Strategic Technology Trend for 2026** — predicts >50% of enterprises will use AI security platforms by 2028 (up from <10% today)
+- **Gartner** predicts manual AI compliance processes will expose 75% of regulated organizations to fines exceeding 5% of global revenue through 2027
 - 86% of organizations experienced AI-related security incidents (Cisco 2025 Cybersecurity Readiness Index)
 - 85% of organizations using some form of AI; 74% using managed AI services (Wiz State of AI 2025)
 - Only 19% have full visibility into where and how AI is used across development (Cycode 2026)
+- 91% of AI tools operate without IT oversight or approval (Reco)
+- 67% of business leaders increasing AI investment; 78% of executives plan to increase cyber spending in 2026
 
-### M&A Wave (2024–2026)
+### Funding & M&A Context
+
+**VC funding:** $18B invested in cybersecurity seed-through-growth rounds in 2025 (highest in 3 years, up 26% YoY). AI security ecosystem specifically: $8.5B across 175 companies over 24 months.
+
+**Cybersecurity M&A hit $102B in 2025** — a 300% increase over 2024 (400+ deals).
+
+**Mega-deals:**
 
 | Target | Acquirer | Price | Date |
 |---|---|---|---|
+| Wiz | Google/Alphabet | $32B | 2025 |
 | Robust Intelligence | Cisco | ~$400M | Oct 2024 |
 | Protect AI | Palo Alto Networks | ~$500M+ | Jul 2025 |
-| Lakera | Check Point | Undisclosed | Sep 2025 |
+| Aim Security | Cato Networks | Undisclosed | 2025 |
+| Lakera | Check Point | Undisclosed | Nov 2025 |
 | Prompt Security | SentinelOne | Undisclosed | Aug 2025 |
+| SGNL | CrowdStrike | $740M | Jan 2026 |
 | Promptfoo | OpenAI | Undisclosed | Mar 2026 |
 
-**Takeaway:** The acqui-hire spree validates the category but also means these capabilities are being absorbed into large platforms that move slowly on integration. The next 12–18 months is an integration tax window.
+**Takeaway:** The acqui-hire spree validates the category but also means these capabilities are being absorbed into large platforms that move slowly on integration. The next 12–18 months is an integration tax window. Notably, Forrester warns enterprises will defer 25% of planned AI spend to 2027 as CFOs demand ROI — compliance-driven products (like AI inventory) are more resilient to this correction than discretionary AI security tools.
 
 ---
 
