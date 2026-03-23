@@ -27,11 +27,185 @@ The `shadow-ai-detector/` module is fully built and covers **DNS/network detecti
 
 ---
 
+## Why Three Sources, Not One
+
+DNS detection alone tells you "someone at IP `10.0.3.42` called `api.openai.com`." That's useful but incomplete. Each source catches things the others miss:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    WHAT EACH SOURCE SEES                     │
+├──────────────┬──────────────────────────────────────────────┤
+│              │                                              │
+│  DNS/Network │  Runtime API calls to AI providers           │
+│  (built)     │  ✓ Production traffic to api.openai.com      │
+│              │  ✓ Shadow AI: dev laptop hitting Claude API   │
+│              │  ✗ Can't see which codebase is making the call│
+│              │  ✗ Can't see AI SDKs that haven't been        │
+│              │    deployed yet (sitting in a branch)         │
+│              │  ✗ Can't see self-hosted models (no external  │
+│              │    API call to intercept)                     │
+│              │                                              │
+├──────────────┼──────────────────────────────────────────────┤
+│              │                                              │
+│  Git repos   │  AI SDKs declared in dependency files        │
+│  (to build)  │  ✓ Which exact codebase uses which AI SDK    │
+│              │  ✓ SDK version (matters for vulns)           │
+│              │  ✓ Code not yet deployed (upcoming risk)     │
+│              │  ✓ Self-hosted model code (torch, vllm,      │
+│              │    transformers — never calls external API)  │
+│              │  ✓ AI in CI/CD (GitHub Action using GPT      │
+│              │    for PR review — no VPC traffic)           │
+│              │  ✗ Can't see runtime usage (SDK in code      │
+│              │    doesn't mean it's being called)           │
+│              │  ✗ Can't see AI tools used without code      │
+│              │    (console-provisioned SageMaker endpoint)  │
+│              │                                              │
+├──────────────┼──────────────────────────────────────────────┤
+│              │                                              │
+│  Cloud       │  AI service spend on the cloud bill          │
+│  billing     │  ✓ Console-provisioned AI (SageMaker         │
+│  (to build)  │    endpoint someone spun up via AWS console) │
+│              │  ✓ Cost attribution (which account, how much)│
+│              │  ✓ Catches managed services that don't       │
+│              │    generate DNS alerts (intra-AWS calls)     │
+│              │  ✗ 24-48 hour delay (billing data is stale)  │
+│              │  ✗ Account-level, not service-level           │
+│              │  ✗ Only sees cloud-provider AI services,     │
+│              │    not third-party API spend (OpenAI bills   │
+│              │    you directly, not through AWS)            │
+│              │                                              │
+└──────────────┴──────────────────────────────────────────────┘
+```
+
+**The value is correlation.** When DNS says `10.0.3.42` is calling `api.openai.com`, git says `payments-api` repo has `openai` in `package.json`, and enrichment says `10.0.3.42` runs `payments-api` — that's a high-confidence asset corroborated by three independent sources. Much harder to dismiss than a single DNS log.
+
+---
+
+## How Team Attribution Works
+
+Every discovery source provides a different signal about who owns the AI usage. No single source is definitive. The asset service layers them together.
+
+### Attribution signals by source
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ SOURCE          │ WHAT IT TELLS US ABOUT OWNERSHIP                  │
+├──────────────────────────────────────────────────────────────────────┤
+│                 │                                                    │
+│ DNS/Network     │ Source IP → EC2 instance → instance tags           │
+│ (enrichment     │                                                    │
+│  service, built)│ enrichment.service.js does two lookups:            │
+│                 │                                                    │
+│                 │ 1. EC2 tag lookup (describeInstances by private IP)│
+│                 │    Tag "service" or "app"  → serviceName           │
+│                 │    Tag "team" or "owner"   → team                  │
+│                 │    Tag "env" or "stage"    → environment           │
+│                 │                                                    │
+│                 │ 2. Tenant service catalog (fallback)               │
+│                 │    Customer uploads IP/CIDR → service mappings     │
+│                 │    Useful for k8s/ECS where IPs are ephemeral      │
+│                 │    Example: "10.0.3.0/24 = payments namespace"     │
+│                 │                                                    │
+│                 │ Confidence: MEDIUM                                 │
+│                 │ Tags can be stale. IPs get reassigned.             │
+│                 │ Many orgs don't tag consistently.                  │
+│                 │                                                    │
+├──────────────────────────────────────────────────────────────────────┤
+│                 │                                                    │
+│ Git repos       │ Repo metadata → team/service                       │
+│                 │                                                    │
+│                 │ 1. Repo name (by convention)                       │
+│                 │    "acme-corp/payments-api" → service=payments-api │
+│                 │                                                    │
+│                 │ 2. CODEOWNERS file (if present)                    │
+│                 │    "* @acme-corp/payments-team" → team=payments    │
+│                 │                                                    │
+│                 │ 3. GitHub/GitLab teams/permissions                  │
+│                 │    Which team has write access to this repo?       │
+│                 │                                                    │
+│                 │ 4. Last committers (weaker signal)                 │
+│                 │    Recent commit authors → individual attribution  │
+│                 │                                                    │
+│                 │ Confidence: HIGH                                   │
+│                 │ If openai SDK is in acme-corp/payments-api, the    │
+│                 │ payments team owns it. No inference needed.        │
+│                 │                                                    │
+├──────────────────────────────────────────────────────────────────────┤
+│                 │                                                    │
+│ Cloud billing   │ AWS account → team                                 │
+│                 │                                                    │
+│                 │ 1. AWS Organizations account name/tags             │
+│                 │    Account 111111111111 = "payments-prod"          │
+│                 │    If it's spending on Bedrock → payments team     │
+│                 │                                                    │
+│                 │ 2. Cost allocation tags (if enabled)               │
+│                 │    Some orgs tag resources with team/project       │
+│                 │    Cost Explorer can group by these tags           │
+│                 │                                                    │
+│                 │ Confidence: MEDIUM-HIGH                            │
+│                 │ Account-level, not resource-level. An account      │
+│                 │ might host multiple teams' workloads.              │
+│                 │                                                    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### How entity resolution merges these signals
+
+When a new discovery arrives, the asset service tries to match it to an existing asset. The match key is **provider + owner identity**, tried from most specific to least specific:
+
+```
+Discovery arrives: { provider: "openai", source: "git", repo: "acme-corp/payments-api" }
+
+Step 1: Extract attribution from the source
+        → repo name "payments-api" → serviceName = "payments-api"
+
+Step 2: Try to find existing asset with same provider + serviceName
+        → Found: ASSET#openai::payments-api (created earlier from DNS finding)
+        → MERGE: add git discovery details to existing asset
+
+Step 3: Asset now has two corroborating sources:
+        discoveredVia: ["network_dns", "git_dependency"]
+        owner.confidence: "high" (two sources agree on serviceName)
+```
+
+**When sources disagree or can't be linked:**
+
+```
+Discovery arrives: { provider: "openai", source: "network", sourceIp: "10.0.5.99" }
+
+Step 1: Extract attribution from the source
+        → EC2 lookup returns no tags (untagged instance)
+        → Service catalog has no mapping for this IP
+        → serviceName = null, team = null
+
+Step 2: Try to find existing asset
+        → No match (no serviceName to match on, no repo to match on)
+
+Step 3: Create new asset with status "unreviewed"
+        → ASSET#openai::unattributed-10.0.5.99
+        → Surfaces in dashboard as "unattributed AI usage — needs review"
+        → Human assigns owner manually via PATCH /api/v1/assets/:id
+```
+
+**This is the honest part:** shadow AI is shadow precisely because it's untagged, unmanaged, and unattributed. The product doesn't pretend to magically know who owns everything. It surfaces the unknown and asks humans to claim it. The value is that it found it at all.
+
+### Attribution confidence levels
+
+| Sources that agree | Confidence | What happens |
+|---|---|---|
+| 3 sources (DNS + git + billing) all point to same team | `confirmed` | Auto-assigned, high trust |
+| 2 sources agree (e.g., DNS enrichment + git repo name) | `high` | Auto-assigned, shown as corroborated |
+| 1 source with strong signal (git repo with CODEOWNERS) | `medium` | Auto-assigned, flagged for verification |
+| 1 source with weak signal (EC2 tag only) | `low` | Suggested owner, needs manual confirmation |
+| 0 sources (no enrichment data, no repo context) | `none` | Unattributed, surfaces as "unknown owner" for review |
+
+---
+
 ## What Needs to Be Built
 
 ### Module 1: Git Repository Scanner
 
-**Purpose:** Discover AI SDK usage in source code by scanning dependency files across all repos.
+**Purpose:** Discover AI SDK usage in source code by scanning dependency files across all repos. Answers "which codebases have AI baked in?" — something DNS can never tell you.
 
 #### 1a. AI Package Registry
 
@@ -321,26 +495,22 @@ This is the **entity resolution** layer — the core IP of the product.
 
 #### 3b. Entity Resolution Logic
 
-The hard part: when a DNS finding, a git match, and a billing line item all refer to the same AI usage, merge them into one asset.
-
-**Resolution rules:**
-
-```
-1. Same provider + same service/team → merge
-2. Same provider + same source IP + same repo (via enrichment) → merge
-3. Same provider + no team attribution → create separate, flag for manual review
-4. Different providers + same repo → separate assets (one repo can use multiple AI providers)
-```
+The hard part: when a DNS finding, a git match, and a billing line item all refer to the same AI usage, merge them into one asset. See "How Team Attribution Works" above for the full walkthrough of how each source contributes ownership signals, how they get merged, and what happens when sources disagree.
 
 **Resolution keys (from most to least specific):**
 
-| Priority | Key | Example |
-|---|---|---|
-| 1 | `provider + service_name` | openai + payments-api |
-| 2 | `provider + repo_name` | openai + acme-corp/payments-api |
-| 3 | `provider + team` | openai + payments-team |
-| 4 | `provider + account_id` | openai + 123456789012 |
-| 5 | `provider` (unattributed) | openai + unknown |
+| Priority | Match Key | Example | When It Fires |
+|---|---|---|---|
+| 1 | `provider + service_name` | `openai::payments-api` | EC2 tags or git repo name both resolve to same service |
+| 2 | `provider + repo_name` | `openai::acme-corp/payments-api` | Git match but DNS enrichment only has IP (no service tag) |
+| 3 | `provider + team` | `openai::payments-team` | Multiple services from same team, can't distinguish which |
+| 4 | `provider + account_id` | `openai::111111111111` | Billing-only discovery, no DNS or git data |
+| 5 | `provider + unattributed` | `openai::unattributed-10.0.5.99` | DNS saw traffic but no enrichment, no git match — flagged for human review |
+
+**Rules:**
+- Same provider + same resolution key → **merge** (add new source to existing asset)
+- Same provider + no attribution data → **create** with `status: "unreviewed"` for manual triage
+- Different providers + same repo → **separate assets** (one repo can use OpenAI and Anthropic — those are two assets)
 
 **Service API:**
 
