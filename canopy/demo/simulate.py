@@ -464,13 +464,14 @@ def check_server():
 
 
 def main():
+    global CANOPY_URL
+
     parser = argparse.ArgumentParser(description="Canopy Demo: Multi-Agent Failure Simulation")
     parser.add_argument("--phase", type=int, choices=[1, 2, 3], help="Run specific phase")
     parser.add_argument("--baseline-calls", type=int, default=100, help="Number of baseline calls")
     parser.add_argument("--url", default=CANOPY_URL, help="Canopy server URL")
     args = parser.parse_args()
 
-    global CANOPY_URL
     CANOPY_URL = args.url
 
     print()
