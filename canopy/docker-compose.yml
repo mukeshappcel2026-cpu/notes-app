@@ -1,0 +1,57 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: canopy
+      POSTGRES_USER: canopy
+      POSTGRES_PASSWORD: canopy_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U canopy"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  memgraph:
+    image: memgraph/memgraph-platform:latest
+    ports:
+      - "7687:7687"   # Bolt protocol
+      - "7444:7444"   # Memgraph Lab
+      - "3000:3000"   # Memgraph Lab UI
+    volumes:
+      - memgraph_data:/var/lib/memgraph
+    environment:
+      MEMGRAPH: "--log-level=WARNING"
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'RETURN 1;' | mgconsole || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  canopy-server:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"   # REST API
+      - "9090:9090"   # gRPC ingestion (future)
+    environment:
+      CANOPY_POSTGRES_DSN: "postgres://canopy:canopy_dev@postgres:5432/canopy?sslmode=disable"
+      CANOPY_MEMGRAPH_HOST: "memgraph"
+      CANOPY_MEMGRAPH_PORT: "7687"
+      CANOPY_LOG_LEVEL: "debug"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      memgraph:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  memgraph_data:
