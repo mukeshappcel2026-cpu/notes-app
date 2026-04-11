@@ -314,6 +314,33 @@ Flags:
 - `-listen` — address to listen on (default `:8082`).
 - `-ttl` — drop links not seen within this window (default `2h`). Set
   to `0` to disable pruning.
+- `-demo` — seed a simulated 17-device, 19-link enterprise topology
+  into the graph on startup instead of waiting for real ingest. Use
+  this to try the viewer without running SNMP against real gear.
+- `-demo-interval` — how often demo mode refreshes its link timestamps
+  (default `10s`). Keeps the viewer's "updated" clock ticking.
+
+### Trying it without real devices
+
+```bash
+go build -o ktranslate-topology ./cmd/ktranslate-topology
+./ktranslate-topology -listen :8082 -demo
+```
+
+Open `http://localhost:8082/` in a browser. You'll see a fully wired
+3-tier network:
+
+- **2 core routers** (`core-r1`, `core-r2`) with an HSRP-style mesh link
+- **3 distribution switches** (`dist-sw1..3`) fully meshed to both cores
+- **6 access switches** (`acc-sw1..6`) hanging off the distribution tier
+- **6 edge devices** — two IP phones, two wireless APs, a Linux server,
+  a Windows workstation — attached to various access switches
+
+Protocol coverage is mixed on purpose: core links are reported by both
+LLDP and CDP (blue), dist-to-access is LLDP-only (green), phones and
+one AP are CDP-only (yellow), and one access-to-AP link uses both so
+the merge path lights up. Every device has a realistic sysDescr and IP
+that show up in the node tooltips.
 
 Endpoints:
 

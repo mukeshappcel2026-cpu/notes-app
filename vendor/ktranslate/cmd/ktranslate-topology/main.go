@@ -26,8 +26,10 @@ import (
 
 func main() {
 	var (
-		listen = flag.String("listen", ":8082", "address to listen on for ingest + UI")
-		ttl    = flag.Duration("ttl", 2*time.Hour, "drop links not seen within this window")
+		listen       = flag.String("listen", ":8082", "address to listen on for ingest + UI")
+		ttl          = flag.Duration("ttl", 2*time.Hour, "drop links not seen within this window")
+		demo         = flag.Bool("demo", false, "seed a simulated enterprise topology instead of waiting for real ingest")
+		demoInterval = flag.Duration("demo-interval", 10*time.Second, "how often the demo seeder refreshes link timestamps")
 	)
 	flag.Parse()
 
@@ -43,6 +45,17 @@ func main() {
 	}
 
 	logger.Printf("listening on %s (link ttl: %s)", *listen, ttl)
+
+	// Demo mode: spin up a goroutine that seeds synthetic topology into
+	// the graph on a timer. The goroutine exits when demoCtx is cancelled
+	// (either on SIGINT/SIGTERM or when http.ErrServerClosed comes back).
+	demoCtx, cancelDemo := context.WithCancel(context.Background())
+	defer cancelDemo()
+	if *demo {
+		logger.Printf("demo mode enabled: seeding %d devices, %d links every %s",
+			len(demoDevices), len(demoLinks), demoInterval)
+		go runDemo(demoCtx, g, *demoInterval, time.Now)
+	}
 
 	// Run the HTTP server in a goroutine so we can react to signals.
 	errCh := make(chan error, 1)
@@ -66,6 +79,7 @@ func main() {
 		return
 	}
 
+	cancelDemo()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := httpSrv.Shutdown(ctx); err != nil {
