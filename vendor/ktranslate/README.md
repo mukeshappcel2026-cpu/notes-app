@@ -236,6 +236,47 @@ To get your own MaxMind key, visit [MaxMind](https://www.maxmind.com).
     	Run VPC Flow Ingest
 ```
 
+# Topology discovery (LLDP / CDP)
+
+ktranslate can discover device-to-device links during its SNMP metadata
+poll by walking LLDP-MIB (`1.0.8802.1.1.2`) and/or CISCO-CDP-MIB
+(`1.3.6.1.4.1.9.9.23`). Discovery is off by default; enable it per device:
+
+```yaml
+devices:
+  core-sw-1:
+    device_ip: 10.10.0.2
+    snmp_comm: public
+    discover_neighbors: true
+    # Optional: restrict to a single protocol. Omit to walk both.
+    # neighbor_protocols: [lldp]
+```
+
+Each discovered link is emitted as one JCHF metadata record tagged with
+`eventType: KSnmpTopology`. Key fields on the record (all in `custom_str`
+except `local_if_index` which lands in `custom_bigint`):
+
+| Field | Meaning |
+| --- | --- |
+| `neighbor_source` | `lldp`, `cdp`, or `lldp+cdp` when both protocols see the same link |
+| `local_if_index` | Local ifIndex (resolved from the collected interface metadata) |
+| `local_if_name` | Local ifDescr / ifName |
+| `remote_sys_name` | Remote device name (LLDP sysName, CDP deviceId) |
+| `remote_chassis_id` | LLDP chassis id (MAC address rendered as colon-hex) |
+| `remote_port_id` | Remote port identifier |
+| `remote_port_desc` | Remote port description |
+| `remote_platform` | CDP platform string (e.g. `cisco WS-C3750`) |
+| `remote_mgmt_addr` | Management address advertised by the neighbor |
+| `remote_capabilities` | Capability bitmap as `0x…` |
+
+Because the records flow through the existing metadata path, every
+downstream format and sink (JSON/NRM/OTEL/Prom/Kafka/New Relic/…) picks
+them up with no additional configuration.
+
+When both LLDP and CDP report the same neighbor on the same local port,
+the two records are merged into a single one with
+`neighbor_source = lldp+cdp`.
+
 # pprof
 To expose profiling endpoints, use the `-metalisten` flag. This can be used with tools such as
 `go tool pprof` to capture and view the data. For example, if `ktranslate` was started with

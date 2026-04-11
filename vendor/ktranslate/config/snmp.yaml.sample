@@ -1,4 +1,15 @@
 devices:
+# Example of a device with LLDP/CDP topology discovery enabled:
+#
+#   core_switch_1:
+#     device_name: core-sw-1
+#     device_ip: 10.10.0.2
+#     snmp_comm: public
+#     # Walk LLDP-MIB and/or CISCO-CDP-MIB during every metadata poll and
+#     # emit one KSnmpTopology JCHF record per discovered neighbor.
+#     discover_neighbors: true
+#     # Restrict to a single protocol if desired; omit to walk both.
+#     # neighbor_protocols: [lldp]
 trap:
   listen: 127.0.0.1:162
   community: hello
