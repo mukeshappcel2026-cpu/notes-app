@@ -193,6 +193,17 @@ func (p *Poller) PollSNMPMetadata(ctx context.Context) (*kt.DeviceData, error) {
 		deviceData.DeviceMetricsMetadata = deviceMetadata
 	}
 
+	if p.conf.DiscoverNeighbors {
+		neighbors, err := PollTopology(ctx, p.conf, p.server, deviceData.InterfaceData, p.log)
+		if err != nil {
+			// Topology errors are non-fatal — log and continue without neighbors.
+			p.log.Warnf("Topology discovery failed: %v", err)
+		} else if len(neighbors) > 0 {
+			deviceData.Neighbors = neighbors
+			p.log.Infof("Discovered %d topology neighbor(s)", len(neighbors))
+		}
+	}
+
 	return deviceData, nil
 }
 
@@ -338,7 +349,66 @@ func (p *Poller) toFlows(dd *kt.DeviceData) ([]*kt.JCHF, error) {
 		p.tcache = tcache
 	}
 
-	return []*kt.JCHF{dst}, nil
+	out := []*kt.JCHF{dst}
+	if len(dd.Neighbors) > 0 {
+		out = append(out, p.neighborsToFlows(dd.Neighbors)...)
+	}
+	return out, nil
+}
+
+// neighborsToFlows emits one JCHF metadata record per discovered neighbor.
+// Each record is tagged with KENTIK_EVENT_SNMP_TOPOLOGY so downstream
+// consumers can distinguish topology events from regular metadata.
+func (p *Poller) neighborsToFlows(neighbors []kt.TopologyNeighbor) []*kt.JCHF {
+	out := make([]*kt.JCHF, 0, len(neighbors))
+	now := time.Now().Unix()
+	for _, n := range neighbors {
+		r := kt.NewJCHF()
+		r.CustomStr = make(map[string]string)
+		r.CustomInt = make(map[string]int32)
+		r.CustomBigInt = make(map[string]int64)
+		r.CustomMetrics = make(map[string]kt.MetricInfo)
+		r.EventType = kt.KENTIK_EVENT_SNMP_TOPOLOGY
+		r.Provider = p.conf.Provider
+		r.DeviceName = p.conf.DeviceName
+		r.SrcAddr = p.conf.DeviceIP
+		r.Timestamp = now
+
+		r.CustomStr["neighbor_source"] = string(n.Source)
+		if n.LocalIfIndex != 0 {
+			r.CustomBigInt["local_if_index"] = n.LocalIfIndex
+		}
+		if n.LocalIfName != "" {
+			r.CustomStr["local_if_name"] = n.LocalIfName
+		}
+		if n.RemoteChassisID != "" {
+			r.CustomStr["remote_chassis_id"] = n.RemoteChassisID
+		}
+		if n.RemoteSysName != "" {
+			r.CustomStr["remote_sys_name"] = n.RemoteSysName
+		}
+		if n.RemoteSysDesc != "" {
+			r.CustomStr["remote_sys_desc"] = n.RemoteSysDesc
+		}
+		if n.RemotePortID != "" {
+			r.CustomStr["remote_port_id"] = n.RemotePortID
+		}
+		if n.RemotePortDesc != "" {
+			r.CustomStr["remote_port_desc"] = n.RemotePortDesc
+		}
+		if n.RemoteMgmtAddr != "" {
+			r.CustomStr["remote_mgmt_addr"] = n.RemoteMgmtAddr
+		}
+		if n.RemoteCapabilities != "" {
+			r.CustomStr["remote_capabilities"] = n.RemoteCapabilities
+		}
+		if n.RemotePlatform != "" {
+			r.CustomStr["remote_platform"] = n.RemotePlatform
+		}
+
+		out = append(out, r)
+	}
+	return out
 }
 
 func (p *Poller) lookupMib(key string, isInterface bool) (*kt.Mib, bool) {

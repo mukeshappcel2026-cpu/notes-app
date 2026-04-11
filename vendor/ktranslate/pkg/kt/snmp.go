@@ -30,6 +30,34 @@ type DeviceData struct {
 	Manufacturer          string                    `yaml:"manufacturer"`
 	InterfaceData         map[string]*InterfaceData `yaml:"interface_data"`
 	DeviceMetricsMetadata *DeviceMetricsMetadata    `yaml:"device_metrics_metadata,omitempty"`
+	Neighbors             []TopologyNeighbor        `yaml:"neighbors,omitempty"`
+}
+
+// NeighborSource identifies which discovery protocol reported a neighbor.
+// When the same link is reported by both LLDP and CDP it's collapsed into
+// NeighborSourceBoth.
+type NeighborSource string
+
+const (
+	NeighborSourceLLDP NeighborSource = "lldp"
+	NeighborSourceCDP  NeighborSource = "cdp"
+	NeighborSourceBoth NeighborSource = "lldp+cdp"
+)
+
+// TopologyNeighbor is a single device-to-device adjacency discovered via
+// LLDP-MIB or CISCO-CDP-MIB during an SNMP metadata poll.
+type TopologyNeighbor struct {
+	Source             NeighborSource `yaml:"source"`
+	LocalIfIndex       int64          `yaml:"local_if_index,omitempty"`
+	LocalIfName        string         `yaml:"local_if_name,omitempty"`
+	RemoteChassisID    string         `yaml:"remote_chassis_id,omitempty"`
+	RemoteSysName      string         `yaml:"remote_sys_name,omitempty"`
+	RemoteSysDesc      string         `yaml:"remote_sys_desc,omitempty"`
+	RemotePortID       string         `yaml:"remote_port_id,omitempty"`
+	RemotePortDesc     string         `yaml:"remote_port_desc,omitempty"`
+	RemoteMgmtAddr     string         `yaml:"remote_mgmt_addr,omitempty"`
+	RemoteCapabilities string         `yaml:"remote_capabilities,omitempty"`
+	RemotePlatform     string         `yaml:"remote_platform,omitempty"`
 }
 
 type DeviceTableMetadata struct {
@@ -211,6 +239,8 @@ type SnmpDeviceConfig struct {
 	MatchAttr           map[string]string `yaml:"match_attributes"`
 	MonitorAdminShut    bool              `yaml:"monitor_admin_shut"`
 	NoUseBulkWalkAll    bool              `yaml:"no_use_bulkwalkall"`
+	DiscoverNeighbors   bool              `yaml:"discover_neighbors,omitempty"` // Collect LLDP/CDP adjacency data during metadata polls.
+	NeighborProtocols   []string          `yaml:"neighbor_protocols,omitempty"` // Subset of {"lldp","cdp"}; empty means both when DiscoverNeighbors is true.
 	InstrumentationName string            `yaml:"instrumentationName,omitempty"`
 	RunPing             bool              `yaml:"response_time,omitempty"`
 	Ext                 *ExtensionSet     `yaml:"ext,omitempty"`
