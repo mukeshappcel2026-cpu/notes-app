@@ -1,14 +1,30 @@
 package metadata
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	"github.com/gosnmp/gosnmp"
 	"github.com/stretchr/testify/assert"
 
+	"github.com/kentik/ktranslate/pkg/eggs/logger"
+	lt "github.com/kentik/ktranslate/pkg/eggs/logger/testing"
 	"github.com/kentik/ktranslate/pkg/kt"
 )
+
+// fakeSNMPWalker is a minimal kt.SNMPTestWalker implementation that
+// serves canned PDU slices from a map keyed by the exact OID root. OIDs
+// that aren't in the map return an empty walk (nil, nil), which matches
+// the behaviour of a device that supports SNMP but doesn't implement a
+// given table.
+type fakeSNMPWalker struct {
+	responses map[string][]gosnmp.SnmpPDU
+}
+
+func (w *fakeSNMPWalker) WalkAll(oid string) ([]gosnmp.SnmpPDU, error) {
+	return w.responses[oid], nil
+}
 
 // cdpPDU builds a synthetic PDU for cdpCacheEntry testing.
 func cdpPDU(col, ifIdx, devIdx string, t gosnmp.Asn1BER, v interface{}) gosnmp.SnmpPDU {
@@ -406,4 +422,161 @@ func TestSelectedNeighborProtocols(t *testing.T) {
 	bogus := selectedNeighborProtocols(&kt.SnmpDeviceConfig{NeighborProtocols: []string{"garbage"}})
 	assert.False(t, bogus[neighborProtocolLLDP])
 	assert.False(t, bogus[neighborProtocolCDP])
+}
+
+// ---- integration tests ----
+//
+// These tests drive pollCDPNeighbors / pollLLDPNeighbors / PollTopology
+// through the real snmp_util.WalkOID path, with a fake kt.SNMPTestWalker
+// plugged into the SnmpDeviceConfig to return canned walk fixtures. They
+// cover the walker → parser seam that the earlier unit tests bypass and
+// make sure PollTopology's error handling and protocol selection work.
+
+// newTestConfig wires up an SnmpDeviceConfig that routes every walk
+// through the given fake walker.
+func newTestConfig(t *testing.T, w *fakeSNMPWalker, protos []string) *kt.SnmpDeviceConfig {
+	t.Helper()
+	conf := &kt.SnmpDeviceConfig{
+		DeviceName:        "test-device",
+		DeviceIP:          "127.0.0.1",
+		DiscoverNeighbors: true,
+		NeighborProtocols: protos,
+	}
+	conf.SetTestWalker(w)
+	return conf
+}
+
+// buildCDPFixture returns a minimal cdpCacheEntry walk result for a
+// single neighbor on ifIndex=3.
+func buildCDPFixture() []gosnmp.SnmpPDU {
+	return []gosnmp.SnmpPDU{
+		cdpPDU("4", "3", "1", gosnmp.OctetString, []byte{10, 0, 0, 2}),
+		cdpPDU("6", "3", "1", gosnmp.OctetString, []byte("peer-sw.example.net")),
+		cdpPDU("7", "3", "1", gosnmp.OctetString, []byte("GigabitEthernet0/24")),
+		cdpPDU("8", "3", "1", gosnmp.OctetString, []byte("cisco WS-C3750")),
+		cdpPDU("9", "3", "1", gosnmp.OctetString, []byte{0x00, 0x00, 0x00, 0x09}), // router,switch
+	}
+}
+
+// buildLLDPFixture returns minimal lldpLocPort + lldpRem + lldpRemManAddr
+// walk results for a single neighbor on lldpLocPortNum=1 resolved to
+// ifIndex=101 via interfaceName subtype.
+func buildLLDPFixture() (loc, rem, man []gosnmp.SnmpPDU) {
+	loc = []gosnmp.SnmpPDU{
+		lldpLocPDU("2", "1", gosnmp.Integer, 5),                              // subtype = interfaceName
+		lldpLocPDU("3", "1", gosnmp.OctetString, []byte("Ethernet1/1")),      // id
+		lldpLocPDU("4", "1", gosnmp.OctetString, []byte("Ethernet1/1")),      // desc
+	}
+	rem = []gosnmp.SnmpPDU{
+		lldpRemPDU("4", "5", "1", "1", gosnmp.Integer, 4), // chassisSubtype = macAddress
+		lldpRemPDU("5", "5", "1", "1", gosnmp.OctetString, []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}),
+		lldpRemPDU("6", "5", "1", "1", gosnmp.Integer, 5), // portSubtype = interfaceName
+		lldpRemPDU("7", "5", "1", "1", gosnmp.OctetString, []byte("Ten1/1")),
+		lldpRemPDU("9", "5", "1", "1", gosnmp.OctetString, []byte("peer-sw.example.net")),
+		lldpRemPDU("12", "5", "1", "1", gosnmp.OctetString, []byte{0x28}), // bridge+router
+	}
+	man = []gosnmp.SnmpPDU{
+		lldpManAddrPDU("5", "1", "1", 1, []byte{10, 0, 0, 2}),
+	}
+	return loc, rem, man
+}
+
+func TestPollCDPNeighbors_Integration(t *testing.T) {
+	log := lt.NewTestContextL(logger.NilContext, t)
+	walker := &fakeSNMPWalker{responses: map[string][]gosnmp.SnmpPDU{
+		oidCDPCacheTable: buildCDPFixture(),
+	}}
+	conf := newTestConfig(t, walker, []string{"cdp"})
+	ifaces := map[string]*kt.InterfaceData{
+		"3": {Index: "3", Description: "GigabitEthernet1/0/3"},
+	}
+
+	got, err := pollCDPNeighbors(context.Background(), conf, &gosnmp.GoSNMP{}, ifaces, log)
+	assert.NoError(t, err)
+	if assert.Len(t, got, 1) {
+		assert.Equal(t, kt.NeighborSourceCDP, got[0].Source)
+		assert.EqualValues(t, 3, got[0].LocalIfIndex)
+		assert.Equal(t, "GigabitEthernet1/0/3", got[0].LocalIfName)
+		assert.Equal(t, "peer-sw.example.net", got[0].RemoteSysName)
+		assert.Equal(t, "10.0.0.2", got[0].RemoteMgmtAddr)
+		assert.Equal(t, "router,switch", got[0].RemoteCapabilities)
+		assert.Equal(t, "cisco WS-C3750", got[0].RemotePlatform)
+	}
+}
+
+func TestPollLLDPNeighbors_Integration(t *testing.T) {
+	log := lt.NewTestContextL(logger.NilContext, t)
+	loc, rem, man := buildLLDPFixture()
+	walker := &fakeSNMPWalker{responses: map[string][]gosnmp.SnmpPDU{
+		oidLLDPLocPortTable:      loc,
+		oidLLDPRemTable:          rem,
+		oidLLDPRemManAddrIfStype: man,
+	}}
+	conf := newTestConfig(t, walker, []string{"lldp"})
+	ifaces := map[string]*kt.InterfaceData{
+		"101": {Index: "101", Description: "Ethernet1/1", ExtraInfo: map[string]string{}},
+	}
+
+	got, err := pollLLDPNeighbors(context.Background(), conf, &gosnmp.GoSNMP{}, ifaces, log)
+	assert.NoError(t, err)
+	if assert.Len(t, got, 1) {
+		n := got[0]
+		assert.Equal(t, kt.NeighborSourceLLDP, n.Source)
+		assert.EqualValues(t, 101, n.LocalIfIndex)
+		assert.Equal(t, "Ethernet1/1", n.LocalIfName)
+		assert.Equal(t, "aa:bb:cc:dd:ee:ff", n.RemoteChassisID)
+		assert.Equal(t, "peer-sw.example.net", n.RemoteSysName)
+		assert.Equal(t, "Ten1/1", n.RemotePortID)
+		assert.Equal(t, "10.0.0.2", n.RemoteMgmtAddr)
+		assert.Equal(t, "bridge,router", n.RemoteCapabilities)
+	}
+}
+
+func TestPollTopology_MergesLLDPAndCDP(t *testing.T) {
+	// Both protocols report the same remote (peer-sw.example.net) on the
+	// same local port (ifIndex=101, which is also lldpLocalPortNum=1 via
+	// interfaceName resolution). PollTopology should merge them into a
+	// single record tagged lldp+cdp.
+	log := lt.NewTestContextL(logger.NilContext, t)
+	loc, rem, man := buildLLDPFixture()
+	cdp := []gosnmp.SnmpPDU{
+		cdpPDU("4", "101", "1", gosnmp.OctetString, []byte{10, 0, 0, 2}),
+		cdpPDU("6", "101", "1", gosnmp.OctetString, []byte("peer-sw.example.net")),
+		cdpPDU("7", "101", "1", gosnmp.OctetString, []byte("Ten1/1")),
+		cdpPDU("8", "101", "1", gosnmp.OctetString, []byte("cisco N9K")),
+	}
+	walker := &fakeSNMPWalker{responses: map[string][]gosnmp.SnmpPDU{
+		oidLLDPLocPortTable:      loc,
+		oidLLDPRemTable:          rem,
+		oidLLDPRemManAddrIfStype: man,
+		oidCDPCacheTable:         cdp,
+	}}
+	conf := newTestConfig(t, walker, nil) // nil => both protocols
+	ifaces := map[string]*kt.InterfaceData{
+		"101": {Index: "101", Description: "Ethernet1/1", ExtraInfo: map[string]string{}},
+	}
+
+	got, err := PollTopology(context.Background(), conf, &gosnmp.GoSNMP{}, ifaces, log)
+	assert.NoError(t, err)
+	if assert.Len(t, got, 1, "LLDP+CDP views of the same neighbor should merge") {
+		assert.Equal(t, kt.NeighborSourceBoth, got[0].Source)
+		// Fields sourced from LLDP survive.
+		assert.Equal(t, "aa:bb:cc:dd:ee:ff", got[0].RemoteChassisID)
+		// Fields only CDP provides are preserved in the merge.
+		assert.Equal(t, "cisco N9K", got[0].RemotePlatform)
+	}
+}
+
+func TestPollTopology_Disabled(t *testing.T) {
+	log := lt.NewTestContextL(logger.NilContext, t)
+	walker := &fakeSNMPWalker{responses: map[string][]gosnmp.SnmpPDU{
+		oidCDPCacheTable: buildCDPFixture(),
+	}}
+	conf := &kt.SnmpDeviceConfig{DeviceName: "off"}
+	conf.SetTestWalker(walker)
+	// DiscoverNeighbors defaults to false; PollTopology should no-op and
+	// not even touch the walker.
+	got, err := PollTopology(context.Background(), conf, &gosnmp.GoSNMP{}, nil, log)
+	assert.NoError(t, err)
+	assert.Nil(t, got)
 }
