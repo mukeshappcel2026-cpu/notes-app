@@ -1,0 +1,141 @@
+# Recommended default config for sending SNMP data to New Relic
+# Includes discovery on startup with a 6 hour recurring interval
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ktranslate
+spec:
+  selector:
+    matchLabels:
+      app: ktranslate
+  template:
+    metadata:
+      labels:
+        app: ktranslate
+    spec:
+      containers:
+      - name: ktranslate
+        image: docker.io/kentik/ktranslate:v2
+        imagePullPolicy: Always
+        env:
+        - name: NEW_RELIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ktranslate-secret
+              key: nr_api_key
+        - name: NR_ACCOUNT_ID
+          valueFrom:
+            secretKeyRef:
+              name: ktranslate-secret
+              key: nr_account_id
+        args:
+          - --metalisten=0.0.0.0:8083
+          - --snmp=/data/snmp-base.yaml
+          - --metrics=jchf
+          - --tee_logs=true
+          - --snmp_discovery_on_start=true
+          - --snmp_discovery_min=360
+          - nr1.snmp
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 256Mi
+          requests:
+            cpu: 500m
+            memory: 128Mi
+        ports:
+        - name: metadata
+          containerPort: 8083
+        - name: snmp
+          containerPort: 1620
+          protocol: UDP
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: metadata
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: metadata
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+          - name: ktranslate-config-claim
+            mountPath: /data
+      volumes:
+        - name: ktranslate-config-claim
+          hostPath:
+            path: /mnt/data/
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ktranslate-metadata
+  labels:
+    app: ktranslate
+spec:
+  ports:
+  - port: 8083
+    name: metadata
+    targetPort: 8083
+    protocol: TCP
+  selector:
+    app: ktranslate
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ktranslate-snmp
+  labels:
+    app: ktranslate
+spec:
+  ports:
+  - port: 1620
+    name: snmp
+    targetPort: 1620
+    protocol: UDP
+  selector:
+    app: ktranslate
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ktranslate-config-claim
+spec:
+  storageClassName: manual
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Mi
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ktranslate-pv-volume
+  labels:
+    type: local
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: "/mnt/data"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ktranslate-secret
+data:
+  nr_account_id: $NR_ACCOUNT_ID
+  nr_api_key: $NR_API_KEY
