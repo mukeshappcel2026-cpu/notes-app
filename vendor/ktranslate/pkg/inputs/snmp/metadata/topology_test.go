@@ -97,6 +97,196 @@ func TestParseCDPNeighbors_NilIfaces(t *testing.T) {
 	}
 }
 
+// lldpLocPDU builds a synthetic lldpLocPortEntry PDU.
+func lldpLocPDU(col, portNum string, t gosnmp.Asn1BER, v interface{}) gosnmp.SnmpPDU {
+	return gosnmp.SnmpPDU{
+		Name:  "." + oidLLDPLocPortTable + "." + col + "." + portNum,
+		Type:  t,
+		Value: v,
+	}
+}
+
+// lldpRemPDU builds a synthetic lldpRemEntry PDU.
+func lldpRemPDU(col, timeMark, locPort, remIdx string, t gosnmp.Asn1BER, v interface{}) gosnmp.SnmpPDU {
+	return gosnmp.SnmpPDU{
+		Name:  "." + oidLLDPRemTable + "." + col + "." + timeMark + "." + locPort + "." + remIdx,
+		Type:  t,
+		Value: v,
+	}
+}
+
+func TestFormatMAC(t *testing.T) {
+	assert.Equal(t, "aa:bb:cc:dd:ee:ff", formatMAC([]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}))
+	// Non-6-byte input falls back to hex so nothing is silently dropped.
+	assert.Equal(t, "aabb", formatMAC([]byte{0xaa, 0xbb}))
+}
+
+func TestDecodeLLDPChassisID(t *testing.T) {
+	// Subtype 4 = macAddress
+	assert.Equal(t, "00:11:22:33:44:55",
+		decodeLLDPChassisID(4, []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}))
+	// Subtype 5 = networkAddress, IPv4 (family=1)
+	assert.Equal(t, "10.0.0.9",
+		decodeLLDPChassisID(5, []byte{0x01, 10, 0, 0, 9}))
+	// Subtype 7 = local, printable string passes through
+	assert.Equal(t, "switch-a",
+		decodeLLDPChassisID(7, []byte("switch-a")))
+	// Non-printable falls back to hex
+	assert.Equal(t, "0011",
+		decodeLLDPChassisID(7, []byte{0x00, 0x11}))
+}
+
+func TestParseLLDPLocPorts(t *testing.T) {
+	pdus := []gosnmp.SnmpPDU{
+		lldpLocPDU("2", "1", gosnmp.Integer, 5),                          // subtype=interfaceName
+		lldpLocPDU("3", "1", gosnmp.OctetString, []byte("Ethernet1/1")),  // id
+		lldpLocPDU("4", "1", gosnmp.OctetString, []byte("Ethernet1/1")),  // desc
+
+		lldpLocPDU("2", "2", gosnmp.Integer, 3),                          // subtype=macAddress
+		lldpLocPDU("3", "2", gosnmp.OctetString, []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}),
+		lldpLocPDU("4", "2", gosnmp.OctetString, []byte("Ethernet1/2")),
+	}
+	out := parseLLDPLocPorts(pdus, oidLLDPLocPortTable)
+	if assert.Contains(t, out, "1") {
+		assert.EqualValues(t, lldpSubtypeInterfaceName, out["1"].subtype)
+		assert.Equal(t, []byte("Ethernet1/1"), out["1"].id)
+		assert.Equal(t, "Ethernet1/1", out["1"].desc)
+	}
+	if assert.Contains(t, out, "2") {
+		assert.EqualValues(t, lldpSubtypeMacAddress, out["2"].subtype)
+		assert.Equal(t, "Ethernet1/2", out["2"].desc)
+	}
+}
+
+func TestParseLLDPNeighbors_InterfaceNameResolution(t *testing.T) {
+	// Two neighbors: one on local port 1 (mapped via interfaceName), one
+	// on local port 2 (mapped via macAddress).
+	ifaces := map[string]*kt.InterfaceData{
+		"101": {
+			Index:       "101",
+			Description: "Ethernet1/1",
+			ExtraInfo:   map[string]string{},
+		},
+		"102": {
+			Index:       "102",
+			Description: "Ethernet1/2",
+			ExtraInfo: map[string]string{
+				SNMP_ifPhysAddress: "aa:bb:cc:dd:ee:ff",
+			},
+		},
+	}
+	locPorts := map[string]*lldpLocPort{
+		"1": {
+			subtype: lldpSubtypeInterfaceName,
+			id:      []byte("Ethernet1/1"),
+			desc:    "Ethernet1/1",
+		},
+		"2": {
+			subtype: lldpSubtypeMacAddress,
+			id:      []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
+			desc:    "Ethernet1/2",
+		},
+	}
+	pdus := []gosnmp.SnmpPDU{
+		// local port 1, timeMark 5, rem index 1 — a neighbor switch
+		lldpRemPDU("4", "5", "1", "1", gosnmp.Integer, 4), // chassisSubtype = macAddress
+		lldpRemPDU("5", "5", "1", "1", gosnmp.OctetString, []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}),
+		lldpRemPDU("6", "5", "1", "1", gosnmp.Integer, 5), // portSubtype = interfaceName
+		lldpRemPDU("7", "5", "1", "1", gosnmp.OctetString, []byte("GigabitEthernet0/24")),
+		lldpRemPDU("8", "5", "1", "1", gosnmp.OctetString, []byte("uplink to core")),
+		lldpRemPDU("9", "5", "1", "1", gosnmp.OctetString, []byte("core-a.example.net")),
+		lldpRemPDU("10", "5", "1", "1", gosnmp.OctetString, []byte("Cisco IOS core-a")),
+		lldpRemPDU("12", "5", "1", "1", gosnmp.OctetString, []byte{0x00, 0x14}),
+
+		// local port 2, timeMark 5, rem index 1 — a server
+		lldpRemPDU("4", "5", "2", "1", gosnmp.Integer, 4),
+		lldpRemPDU("5", "5", "2", "1", gosnmp.OctetString, []byte{0xde, 0xad, 0xbe, 0xef, 0x00, 0x01}),
+		lldpRemPDU("6", "5", "2", "1", gosnmp.Integer, 3), // portSubtype = macAddress
+		lldpRemPDU("7", "5", "2", "1", gosnmp.OctetString, []byte{0xde, 0xad, 0xbe, 0xef, 0x00, 0x02}),
+		lldpRemPDU("9", "5", "2", "1", gosnmp.OctetString, []byte("server-1")),
+	}
+
+	got := parseLLDPNeighbors(pdus, oidLLDPRemTable, locPorts, ifaces)
+	if assert.Len(t, got, 2) {
+		n0 := got[0]
+		assert.Equal(t, kt.NeighborSourceLLDP, n0.Source)
+		assert.EqualValues(t, 101, n0.LocalIfIndex)
+		assert.Equal(t, "Ethernet1/1", n0.LocalIfName)
+		assert.Equal(t, "00:11:22:33:44:55", n0.RemoteChassisID)
+		assert.Equal(t, "core-a.example.net", n0.RemoteSysName)
+		assert.Equal(t, "Cisco IOS core-a", n0.RemoteSysDesc)
+		assert.Equal(t, "GigabitEthernet0/24", n0.RemotePortID)
+		assert.Equal(t, "uplink to core", n0.RemotePortDesc)
+		assert.Equal(t, "0x0014", n0.RemoteCapabilities)
+
+		n1 := got[1]
+		assert.EqualValues(t, 102, n1.LocalIfIndex)
+		assert.Equal(t, "Ethernet1/2", n1.LocalIfName)
+		assert.Equal(t, "deadbeef:0001", "deadbeef:0001") // sanity
+		assert.Equal(t, "de:ad:be:ef:00:01", n1.RemoteChassisID)
+		assert.Equal(t, "de:ad:be:ef:00:02", n1.RemotePortID, "mac port id should be formatted")
+		assert.Equal(t, "server-1", n1.RemoteSysName)
+	}
+}
+
+func TestParseLLDPNeighbors_DescFallback(t *testing.T) {
+	// locPort subtype 7 (local) — resolve via desc match against ifDescr.
+	ifaces := map[string]*kt.InterfaceData{
+		"7": {Index: "7", Description: "Fa0/7", ExtraInfo: map[string]string{}},
+	}
+	locPorts := map[string]*lldpLocPort{
+		"7": {subtype: lldpSubtypeLocal, id: []byte("7"), desc: "Fa0/7"},
+	}
+	pdus := []gosnmp.SnmpPDU{
+		lldpRemPDU("4", "1", "7", "1", gosnmp.Integer, 4),
+		lldpRemPDU("5", "1", "7", "1", gosnmp.OctetString, []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}),
+		lldpRemPDU("9", "1", "7", "1", gosnmp.OctetString, []byte("neighbor")),
+	}
+	got := parseLLDPNeighbors(pdus, oidLLDPRemTable, locPorts, ifaces)
+	if assert.Len(t, got, 1) {
+		assert.EqualValues(t, 7, got[0].LocalIfIndex)
+		assert.Equal(t, "Fa0/7", got[0].LocalIfName)
+	}
+}
+
+func TestMergeNeighbors_LLDPAndCDP(t *testing.T) {
+	// Same local ifIndex and remote sysName seen via LLDP and CDP should
+	// collapse into a single record with Source=lldp+cdp.
+	in := []kt.TopologyNeighbor{
+		{
+			Source:          kt.NeighborSourceLLDP,
+			LocalIfIndex:    3,
+			LocalIfName:     "Eth1/3",
+			RemoteSysName:   "peer-a",
+			RemoteChassisID: "00:11:22:33:44:55",
+			RemotePortID:    "Eth1/1",
+		},
+		{
+			Source:         kt.NeighborSourceCDP,
+			LocalIfIndex:   3,
+			LocalIfName:    "Eth1/3",
+			RemoteSysName:  "peer-a",
+			RemotePortID:   "Eth1/1",
+			RemotePlatform: "cisco N9K",
+		},
+	}
+	out := mergeNeighbors(in)
+	if assert.Len(t, out, 1) {
+		assert.Equal(t, kt.NeighborSourceBoth, out[0].Source)
+		assert.Equal(t, "00:11:22:33:44:55", out[0].RemoteChassisID)
+		assert.Equal(t, "cisco N9K", out[0].RemotePlatform)
+	}
+}
+
+func TestMergeNeighbors_DistinctNeighborsStay(t *testing.T) {
+	in := []kt.TopologyNeighbor{
+		{Source: kt.NeighborSourceLLDP, LocalIfIndex: 1, RemoteSysName: "a"},
+		{Source: kt.NeighborSourceLLDP, LocalIfIndex: 2, RemoteSysName: "b"},
+	}
+	out := mergeNeighbors(in)
+	assert.Len(t, out, 2, "same protocol on different ports should not be merged")
+}
+
 func TestSelectedNeighborProtocols(t *testing.T) {
 	both := selectedNeighborProtocols(&kt.SnmpDeviceConfig{})
 	assert.True(t, both[neighborProtocolLLDP])

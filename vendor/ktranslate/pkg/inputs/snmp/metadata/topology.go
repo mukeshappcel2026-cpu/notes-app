@@ -91,15 +91,331 @@ func selectedNeighborProtocols(conf *kt.SnmpDeviceConfig) map[string]bool {
 	return out
 }
 
-// pollLLDPNeighbors is a stub until Stage 3. It intentionally performs no
-// walks so the Stage 1 wiring can land in isolation.
+// LLDP lldpLocPortIdSubtype values from LLDP-MIB.
+const (
+	lldpSubtypeInterfaceAlias = 1
+	lldpSubtypePortComponent  = 2
+	lldpSubtypeMacAddress     = 3
+	lldpSubtypeNetworkAddress = 4
+	lldpSubtypeInterfaceName  = 5
+	lldpSubtypeAgentCircuitID = 6
+	lldpSubtypeLocal          = 7
+)
+
+// lldpLocPort captures the resolver inputs for one entry of lldpLocPortEntry.
+type lldpLocPort struct {
+	subtype int64
+	id      []byte
+	desc    string
+}
+
+// pollLLDPNeighbors walks lldpLocPortTable and lldpRemTable and returns
+// discovered neighbors. The ifaces map is used to map lldpLocalPortNum
+// (an opaque identifier) to a concrete local ifIndex / ifName.
 func pollLLDPNeighbors(ctx context.Context, conf *kt.SnmpDeviceConfig, server *gosnmp.GoSNMP, ifaces map[string]*kt.InterfaceData, log logger.ContextL) ([]kt.TopologyNeighbor, error) {
-	_ = ctx
-	_ = conf
-	_ = server
-	_ = ifaces
-	_ = log
-	return nil, nil
+	// lldpLocPortEntry first — we need it to resolve local port numbers.
+	// Failure here isn't fatal: we can still report neighbors without a
+	// local ifIndex / ifName by leaving those fields zero.
+	var locPorts map[string]*lldpLocPort
+	locPDUs, err := snmp_util.WalkOID(ctx, conf, oidLLDPLocPortTable, server, log, "LLDPLocPort")
+	if err != nil {
+		log.Infof("LLDP local-port walk failed, proceeding without local-port resolution: %v", err)
+	} else {
+		locPorts = parseLLDPLocPorts(locPDUs, oidLLDPLocPortTable)
+	}
+
+	remPDUs, err := snmp_util.WalkOID(ctx, conf, oidLLDPRemTable, server, log, "LLDPRem")
+	if err != nil {
+		return nil, err
+	}
+	return parseLLDPNeighbors(remPDUs, oidLLDPRemTable, locPorts, ifaces), nil
+}
+
+// parseLLDPLocPorts builds a map keyed by the LLDP local-port-number (as a
+// decimal string) from a walk of lldpLocPortEntry.
+//
+// lldpLocPortEntry OID layout: .<base>.<col>.<lldpLocalPortNum>
+// Columns of interest: .2 subtype, .3 id, .4 desc.
+func parseLLDPLocPorts(pdus []gosnmp.SnmpPDU, base string) map[string]*lldpLocPort {
+	out := map[string]*lldpLocPort{}
+	get := func(k string) *lldpLocPort {
+		if p, ok := out[k]; ok {
+			return p
+		}
+		p := &lldpLocPort{}
+		out[k] = p
+		return p
+	}
+	for _, pdu := range pdus {
+		parts := trimOIDSuffix(pdu.Name, base)
+		if len(parts) < 2 {
+			continue
+		}
+		col := parts[0]
+		portNum := parts[len(parts)-1]
+		p := get(portNum)
+		switch col {
+		case "2":
+			p.subtype = gosnmp.ToBigInt(pdu.Value).Int64()
+		case "3":
+			if b, ok := pdu.Value.([]byte); ok && pdu.Type == gosnmp.OctetString {
+				p.id = b
+			}
+		case "4":
+			if s, ok := snmp_util.ReadOctetString(pdu, true); ok {
+				p.desc = s
+			}
+		}
+	}
+	return out
+}
+
+// parseLLDPNeighbors builds TopologyNeighbor records from a walk of
+// lldpRemEntry. It's split out from pollLLDPNeighbors for testability.
+//
+// lldpRemEntry OID layout:
+//
+//	.<base>.<col>.<lldpRemTimeMark>.<lldpLocalPortNum>.<lldpRemIndex>
+//
+// Columns of interest:
+//
+//	.4  lldpRemChassisIdSubtype (INTEGER)
+//	.5  lldpRemChassisId        (OCTET STRING, subtype-dependent encoding)
+//	.6  lldpRemPortIdSubtype    (INTEGER)
+//	.7  lldpRemPortId           (OCTET STRING, subtype-dependent encoding)
+//	.8  lldpRemPortDesc         (OCTET STRING)
+//	.9  lldpRemSysName          (OCTET STRING)
+//	.10 lldpRemSysDesc          (OCTET STRING)
+//	.12 lldpRemSysCapEnabled    (OCTET STRING, bit-packed)
+func parseLLDPNeighbors(pdus []gosnmp.SnmpPDU, base string, locPorts map[string]*lldpLocPort, ifaces map[string]*kt.InterfaceData) []kt.TopologyNeighbor {
+	type scratch struct {
+		chassisSubtype int64
+		chassisRaw     []byte
+		portSubtype    int64
+		portRaw        []byte
+		n              *kt.TopologyNeighbor
+	}
+
+	byKey := map[string]*scratch{}
+	order := []string{}
+
+	get := func(timeMark, locPort, remIdx string) *scratch {
+		key := timeMark + "." + locPort + "." + remIdx
+		if s, ok := byKey[key]; ok {
+			return s
+		}
+		s := &scratch{n: &kt.TopologyNeighbor{Source: kt.NeighborSourceLLDP, LocalIfName: locPort}}
+		// Record the raw local port number so callers see something even
+		// if resolution fails; it gets overwritten with the real ifName
+		// below.
+		byKey[key] = s
+		order = append(order, key)
+		return s
+	}
+
+	for _, pdu := range pdus {
+		parts := trimOIDSuffix(pdu.Name, base)
+		if len(parts) < 4 {
+			continue
+		}
+		col := parts[0]
+		// Last three are the (timeMark, locPort, remIdx) tuple.
+		timeMark := parts[len(parts)-3]
+		locPort := parts[len(parts)-2]
+		remIdx := parts[len(parts)-1]
+		s := get(timeMark, locPort, remIdx)
+
+		switch col {
+		case "4":
+			s.chassisSubtype = gosnmp.ToBigInt(pdu.Value).Int64()
+		case "5":
+			if b, ok := pdu.Value.([]byte); ok && pdu.Type == gosnmp.OctetString {
+				s.chassisRaw = b
+			}
+		case "6":
+			s.portSubtype = gosnmp.ToBigInt(pdu.Value).Int64()
+		case "7":
+			if b, ok := pdu.Value.([]byte); ok && pdu.Type == gosnmp.OctetString {
+				s.portRaw = b
+			}
+		case "8":
+			if v, ok := snmp_util.ReadOctetString(pdu, true); ok {
+				s.n.RemotePortDesc = v
+			}
+		case "9":
+			if v, ok := snmp_util.ReadOctetString(pdu, true); ok {
+				s.n.RemoteSysName = v
+			}
+		case "10":
+			if v, ok := snmp_util.ReadOctetString(pdu, true); ok {
+				s.n.RemoteSysDesc = v
+			}
+		case "12":
+			if v, ok := decodeCapabilityBits(pdu); ok {
+				s.n.RemoteCapabilities = v
+			}
+		}
+	}
+
+	out := make([]kt.TopologyNeighbor, 0, len(order))
+	for _, k := range order {
+		s := byKey[k]
+		// Finalize the chassis id / port id strings now that we have their subtypes.
+		s.n.RemoteChassisID = decodeLLDPChassisID(s.chassisSubtype, s.chassisRaw)
+		if pid := decodeLLDPPortID(s.portSubtype, s.portRaw); pid != "" {
+			s.n.RemotePortID = pid
+		}
+		// Resolve local ifIndex / ifName.
+		// key is "<timeMark>.<locPort>.<remIdx>"; pull the middle element.
+		keyParts := strings.Split(k, ".")
+		if len(keyParts) == 3 {
+			resolveLLDPLocal(s.n, keyParts[1], locPorts, ifaces)
+		}
+		out = append(out, *s.n)
+	}
+	return out
+}
+
+// resolveLLDPLocal fills LocalIfIndex and LocalIfName on the neighbor by
+// looking at the lldpLocPort entry for the given local port number and
+// matching it against the interface metadata collected earlier.
+func resolveLLDPLocal(n *kt.TopologyNeighbor, locPort string, locPorts map[string]*lldpLocPort, ifaces map[string]*kt.InterfaceData) {
+	info, ok := locPorts[locPort]
+	if !ok || info == nil {
+		// No local-port info. Leave LocalIfName as the raw LLDP port
+		// number so downstream consumers at least have something.
+		return
+	}
+	if info.desc != "" {
+		n.LocalIfName = info.desc
+	}
+
+	if ifaces == nil || len(ifaces) == 0 {
+		return
+	}
+
+	idStr := string(info.id)
+	switch info.subtype {
+	case lldpSubtypeInterfaceAlias:
+		for idx, d := range ifaces {
+			if d.Alias != "" && d.Alias == idStr {
+				setLocal(n, idx, d)
+				return
+			}
+		}
+	case lldpSubtypeInterfaceName:
+		for idx, d := range ifaces {
+			if d.Description != "" && d.Description == idStr {
+				setLocal(n, idx, d)
+				return
+			}
+		}
+	case lldpSubtypeMacAddress:
+		mac := formatMAC(info.id)
+		for idx, d := range ifaces {
+			if d.ExtraInfo == nil {
+				continue
+			}
+			if phys, ok := d.ExtraInfo[SNMP_ifPhysAddress]; ok && phys != "" && strings.EqualFold(phys, mac) {
+				setLocal(n, idx, d)
+				return
+			}
+		}
+	case lldpSubtypeLocal, lldpSubtypePortComponent, lldpSubtypeAgentCircuitID:
+		// Fall through to the description-based fallback below.
+	}
+
+	// Generic fallback: match lldpLocPortDesc against ifDescr.
+	if info.desc != "" {
+		for idx, d := range ifaces {
+			if d.Description == info.desc {
+				setLocal(n, idx, d)
+				return
+			}
+		}
+	}
+}
+
+func setLocal(n *kt.TopologyNeighbor, idxStr string, d *kt.InterfaceData) {
+	if i, err := strconv.ParseInt(idxStr, 10, 64); err == nil {
+		n.LocalIfIndex = i
+	}
+	if d.Description != "" {
+		n.LocalIfName = d.Description
+	}
+}
+
+// decodeLLDPChassisID renders a chassis id according to its subtype.
+// Subtype 4 (macAddress) is the most common on real gear; everything else
+// either comes through as a string or as hex when the bytes don't form a
+// printable string.
+func decodeLLDPChassisID(subtype int64, b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	switch subtype {
+	case 4: // macAddress
+		return formatMAC(b)
+	case 5: // networkAddress (first byte = address family per IANA)
+		if len(b) == 5 && b[0] == 1 { // IPv4
+			return fmt.Sprintf("%d.%d.%d.%d", b[1], b[2], b[3], b[4])
+		}
+		return hex.EncodeToString(b)
+	default:
+		if s, ok := printableString(b); ok {
+			return s
+		}
+		return hex.EncodeToString(b)
+	}
+}
+
+// decodeLLDPPortID renders a port id according to its subtype.
+func decodeLLDPPortID(subtype int64, b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	switch subtype {
+	case 3: // macAddress
+		return formatMAC(b)
+	default:
+		if s, ok := printableString(b); ok {
+			return s
+		}
+		return hex.EncodeToString(b)
+	}
+}
+
+func formatMAC(b []byte) string {
+	if len(b) != 6 {
+		return hex.EncodeToString(b)
+	}
+	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
+}
+
+// printableString returns the bytes as a UTF-8 string if every byte is a
+// printable ASCII character or common whitespace; otherwise ok=false.
+func printableString(b []byte) (string, bool) {
+	for _, c := range b {
+		if c < 0x20 || c > 0x7e {
+			return "", false
+		}
+	}
+	return string(b), true
+}
+
+// trimOIDSuffix strips a leading dot and the base OID from a PDU name,
+// returning the remaining index components split on ".". Returns nil if
+// the name doesn't belong to the table.
+func trimOIDSuffix(name, base string) []string {
+	trimmed := strings.TrimPrefix(name, ".")
+	if !strings.HasPrefix(trimmed, base) {
+		return nil
+	}
+	suffix := strings.TrimPrefix(trimmed[len(base):], ".")
+	if suffix == "" {
+		return nil
+	}
+	return strings.Split(suffix, ".")
 }
 
 // pollCDPNeighbors walks the cdpCacheTable and returns any discovered
