@@ -1,6 +1,7 @@
 package metadata
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/gosnmp/gosnmp"
@@ -206,7 +207,7 @@ func TestParseLLDPNeighbors_InterfaceNameResolution(t *testing.T) {
 		lldpRemPDU("9", "5", "2", "1", gosnmp.OctetString, []byte("server-1")),
 	}
 
-	got := parseLLDPNeighbors(pdus, oidLLDPRemTable, locPorts, ifaces)
+	got := parseLLDPNeighbors(pdus, oidLLDPRemTable, locPorts, ifaces, nil)
 	if assert.Len(t, got, 2) {
 		n0 := got[0]
 		assert.Equal(t, kt.NeighborSourceLLDP, n0.Source)
@@ -229,6 +230,67 @@ func TestParseLLDPNeighbors_InterfaceNameResolution(t *testing.T) {
 	}
 }
 
+// lldpManAddrPDU builds a synthetic lldpRemManAddrEntry row PDU. The OID
+// suffix after the base column is
+// <timeMark>.<locPort>.<remIdx>.<addrSubtype>.<addrLen>.<b1>...<bN>.
+func lldpManAddrPDU(timeMark, locPort, remIdx string, addrSubtype int, addr []byte) gosnmp.SnmpPDU {
+	oid := "." + oidLLDPRemManAddrIfStype + "." + timeMark + "." + locPort + "." + remIdx + "." +
+		itoa(addrSubtype) + "." + itoa(len(addr))
+	for _, b := range addr {
+		oid += "." + itoa(int(b))
+	}
+	return gosnmp.SnmpPDU{Name: oid, Type: gosnmp.Integer, Value: 1}
+}
+
+func itoa(i int) string { return fmt.Sprintf("%d", i) }
+
+func TestParseLLDPManAddrs_IPv4(t *testing.T) {
+	pdus := []gosnmp.SnmpPDU{
+		lldpManAddrPDU("5", "1", "1", 1, []byte{10, 0, 0, 9}),
+		lldpManAddrPDU("5", "1", "1", 2, []byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}),
+		lldpManAddrPDU("5", "2", "1", 1, []byte{172, 16, 0, 5}),
+	}
+	got := parseLLDPManAddrs(pdus, oidLLDPRemManAddrIfStype)
+	// First-seen wins, so (5,1,1) keeps the IPv4 address.
+	assert.Equal(t, "10.0.0.9", got["5.1.1"])
+	assert.Equal(t, "172.16.0.5", got["5.2.1"])
+}
+
+func TestParseLLDPManAddrs_IPv6(t *testing.T) {
+	pdus := []gosnmp.SnmpPDU{
+		lldpManAddrPDU("5", "3", "1", 2,
+			[]byte{0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01}),
+	}
+	got := parseLLDPManAddrs(pdus, oidLLDPRemManAddrIfStype)
+	assert.Equal(t, "fe80:0:0:0:0:0:0:1", got["5.3.1"])
+}
+
+func TestParseLLDPManAddrs_Malformed(t *testing.T) {
+	// Truncated: claims addrLen=4 but only supplies 2 bytes.
+	truncated := gosnmp.SnmpPDU{
+		Name:  "." + oidLLDPRemManAddrIfStype + ".5.1.1.1.4.10.0",
+		Type:  gosnmp.Integer,
+		Value: 1,
+	}
+	got := parseLLDPManAddrs([]gosnmp.SnmpPDU{truncated}, oidLLDPRemManAddrIfStype)
+	assert.Empty(t, got)
+}
+
+func TestParseLLDPNeighbors_AttachesManagementAddress(t *testing.T) {
+	// Minimum PDUs to produce one neighbor on (timeMark=5, locPort=1, remIdx=1).
+	pdus := []gosnmp.SnmpPDU{
+		lldpRemPDU("4", "5", "1", "1", gosnmp.Integer, 4),
+		lldpRemPDU("5", "5", "1", "1", gosnmp.OctetString, []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}),
+		lldpRemPDU("9", "5", "1", "1", gosnmp.OctetString, []byte("peer")),
+	}
+	manAddrs := map[string]string{"5.1.1": "192.0.2.10"}
+	got := parseLLDPNeighbors(pdus, oidLLDPRemTable, nil, nil, manAddrs)
+	if assert.Len(t, got, 1) {
+		assert.Equal(t, "192.0.2.10", got[0].RemoteMgmtAddr)
+		assert.Equal(t, "peer", got[0].RemoteSysName)
+	}
+}
+
 func TestParseLLDPNeighbors_DescFallback(t *testing.T) {
 	// locPort subtype 7 (local) — resolve via desc match against ifDescr.
 	ifaces := map[string]*kt.InterfaceData{
@@ -242,7 +304,7 @@ func TestParseLLDPNeighbors_DescFallback(t *testing.T) {
 		lldpRemPDU("5", "1", "7", "1", gosnmp.OctetString, []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}),
 		lldpRemPDU("9", "1", "7", "1", gosnmp.OctetString, []byte("neighbor")),
 	}
-	got := parseLLDPNeighbors(pdus, oidLLDPRemTable, locPorts, ifaces)
+	got := parseLLDPNeighbors(pdus, oidLLDPRemTable, locPorts, ifaces, nil)
 	if assert.Len(t, got, 1) {
 		assert.EqualValues(t, 7, got[0].LocalIfIndex)
 		assert.Equal(t, "Fa0/7", got[0].LocalIfName)

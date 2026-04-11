@@ -21,7 +21,11 @@ import (
 //   lldpRemEntry        .1.0.8802.1.1.2.1.4.1.1   (columns 4 chassisSubtype, 5 chassisId,
 //                                                  6 portSubtype, 7 portId, 8 portDesc,
 //                                                  9 sysName, 10 sysDesc, 12 capEnabled)
-//   lldpRemManAddrEntry .1.0.8802.1.1.2.1.4.2.1   (column 3 ifSubtype, 5 ifId — not walked here)
+//   lldpRemManAddrEntry .1.0.8802.1.1.2.1.4.2.1   table indexed by
+//                                                 (timeMark, locPortNum, remIdx,
+//                                                  addrSubtype, addrLen, addrBytes...);
+//                                                 walk column .3 (ifSubtype) to
+//                                                 recover every row.
 //
 // CISCO-CDP-MIB:
 //   cdpCacheEntry       .1.3.6.1.4.1.9.9.23.1.2.1.1   indexed by (ifIndex, cdpCacheDeviceIndex)
@@ -29,9 +33,12 @@ import (
 //                                                      6 deviceId, 7 devicePort, 8 platform,
 //                                                      9 capabilities)
 const (
-	oidLLDPLocPortTable = "1.0.8802.1.1.2.1.3.7.1"
-	oidLLDPRemTable     = "1.0.8802.1.1.2.1.4.1.1"
-	oidCDPCacheTable    = "1.3.6.1.4.1.9.9.23.1.2.1.1"
+	oidLLDPLocPortTable      = "1.0.8802.1.1.2.1.3.7.1"
+	oidLLDPRemTable          = "1.0.8802.1.1.2.1.4.1.1"
+	oidLLDPRemManAddrTable   = "1.0.8802.1.1.2.1.4.2.1"
+	oidLLDPRemManAddrIfStype = "1.0.8802.1.1.2.1.4.2.1.3" // any column works; pick one guaranteed to exist
+
+	oidCDPCacheTable = "1.3.6.1.4.1.9.9.23.1.2.1.1"
 
 	neighborProtocolLLDP = "lldp"
 	neighborProtocolCDP  = "cdp"
@@ -128,7 +135,20 @@ func pollLLDPNeighbors(ctx context.Context, conf *kt.SnmpDeviceConfig, server *g
 	if err != nil {
 		return nil, err
 	}
-	return parseLLDPNeighbors(remPDUs, oidLLDPRemTable, locPorts, ifaces), nil
+
+	// Management addresses live in a separate table whose rows are keyed by
+	// (timeMark, locPort, remIdx, addrSubtype, addr...). Walking it is
+	// best-effort: if the device doesn't support it, we just skip the
+	// enrichment.
+	var manAddrs map[string]string
+	manAddrPDUs, err := snmp_util.WalkOID(ctx, conf, oidLLDPRemManAddrIfStype, server, log, "LLDPRemManAddr")
+	if err != nil {
+		log.Infof("LLDP management-address walk failed, skipping enrichment: %v", err)
+	} else {
+		manAddrs = parseLLDPManAddrs(manAddrPDUs, oidLLDPRemManAddrIfStype)
+	}
+
+	return parseLLDPNeighbors(remPDUs, oidLLDPRemTable, locPorts, ifaces, manAddrs), nil
 }
 
 // parseLLDPLocPorts builds a map keyed by the LLDP local-port-number (as a
@@ -170,6 +190,82 @@ func parseLLDPLocPorts(pdus []gosnmp.SnmpPDU, base string) map[string]*lldpLocPo
 	return out
 }
 
+// parseLLDPManAddrs walks lldpRemManAddrEntry rows (e.g. from a walk of
+// column .3 lldpRemManAddrIfSubtype) and returns a map keyed by
+// "<timeMark>.<locPort>.<remIdx>" whose value is the first management
+// address found for that remote, formatted as an IPv4 dotted quad, IPv6
+// colon-hex, or generic hex fallback.
+//
+// A walked row looks like
+//
+//	.<base>.<timeMark>.<locPort>.<remIdx>.<addrSubtype>.<addrLen>.<b1>.<b2>...
+//
+// where addrSubtype is an IANA AddressFamilyNumbers value (1=ipv4, 2=ipv6)
+// and addrLen is the number of bytes that follow.
+func parseLLDPManAddrs(pdus []gosnmp.SnmpPDU, base string) map[string]string {
+	out := map[string]string{}
+	for _, pdu := range pdus {
+		parts := trimOIDSuffix(pdu.Name, base)
+		// Need at least: timeMark, locPort, remIdx, addrSubtype, addrLen,
+		// and one address byte.
+		if len(parts) < 6 {
+			continue
+		}
+		timeMark := parts[0]
+		locPort := parts[1]
+		remIdx := parts[2]
+		subtype, err := strconv.Atoi(parts[3])
+		if err != nil {
+			continue
+		}
+		addrLen, err := strconv.Atoi(parts[4])
+		if err != nil || addrLen < 1 || len(parts) < 5+addrLen {
+			continue
+		}
+		addrBytes := make([]byte, 0, addrLen)
+		for i := 0; i < addrLen; i++ {
+			v, err := strconv.Atoi(parts[5+i])
+			if err != nil || v < 0 || v > 255 {
+				addrBytes = nil
+				break
+			}
+			addrBytes = append(addrBytes, byte(v))
+		}
+		if addrBytes == nil {
+			continue
+		}
+
+		key := timeMark + "." + locPort + "." + remIdx
+		if _, seen := out[key]; seen {
+			// Keep the first one we observed so output is deterministic.
+			continue
+		}
+		out[key] = formatLLDPManAddr(subtype, addrBytes)
+	}
+	return out
+}
+
+// formatLLDPManAddr renders the raw address bytes according to the IANA
+// address-family subtype. Unknown families fall through to hex so nothing
+// is lost.
+func formatLLDPManAddr(subtype int, b []byte) string {
+	switch subtype {
+	case 1: // ipv4
+		if len(b) == 4 {
+			return fmt.Sprintf("%d.%d.%d.%d", b[0], b[1], b[2], b[3])
+		}
+	case 2: // ipv6
+		if len(b) == 16 {
+			parts := make([]string, 8)
+			for i := 0; i < 8; i++ {
+				parts[i] = fmt.Sprintf("%x", (uint16(b[2*i])<<8)|uint16(b[2*i+1]))
+			}
+			return strings.Join(parts, ":")
+		}
+	}
+	return hex.EncodeToString(b)
+}
+
 // parseLLDPNeighbors builds TopologyNeighbor records from a walk of
 // lldpRemEntry. It's split out from pollLLDPNeighbors for testability.
 //
@@ -187,7 +283,11 @@ func parseLLDPLocPorts(pdus []gosnmp.SnmpPDU, base string) map[string]*lldpLocPo
 //	.9  lldpRemSysName          (OCTET STRING)
 //	.10 lldpRemSysDesc          (OCTET STRING)
 //	.12 lldpRemSysCapEnabled    (OCTET STRING, bit-packed)
-func parseLLDPNeighbors(pdus []gosnmp.SnmpPDU, base string, locPorts map[string]*lldpLocPort, ifaces map[string]*kt.InterfaceData) []kt.TopologyNeighbor {
+//
+// manAddrs (optional) is keyed by "timeMark.locPort.remIdx" and supplies a
+// management address previously extracted from lldpRemManAddrEntry; pass nil
+// to skip that enrichment.
+func parseLLDPNeighbors(pdus []gosnmp.SnmpPDU, base string, locPorts map[string]*lldpLocPort, ifaces map[string]*kt.InterfaceData, manAddrs map[string]string) []kt.TopologyNeighbor {
 	type scratch struct {
 		chassisSubtype int64
 		chassisRaw     []byte
@@ -270,6 +370,9 @@ func parseLLDPNeighbors(pdus []gosnmp.SnmpPDU, base string, locPorts map[string]
 		keyParts := strings.Split(k, ".")
 		if len(keyParts) == 3 {
 			resolveLLDPLocal(s.n, keyParts[1], locPorts, ifaces)
+		}
+		if addr, ok := manAddrs[k]; ok && addr != "" {
+			s.n.RemoteMgmtAddr = addr
 		}
 		out = append(out, *s.n)
 	}
