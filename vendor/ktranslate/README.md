@@ -277,6 +277,53 @@ When both LLDP and CDP report the same neighbor on the same local port,
 the two records are merged into a single one with
 `neighbor_source = lldp+cdp`.
 
+## Live topology viewer
+
+A standalone viewer lives alongside the main binary at
+`cmd/ktranslate-topology`. It ingests `KSnmpTopology` records from the
+main ktranslate process over HTTP, stitches them into a graph (with
+reciprocal views collapsed and stale links pruned), and serves an
+auto-refreshing web page that draws devices, their interfaces, and the
+links between them.
+
+Build and run the viewer:
+
+```bash
+go build -o ktranslate-topology ./cmd/ktranslate-topology
+./ktranslate-topology -listen :8082 -ttl 2h
+```
+
+Point the main ktranslate process at it using the existing `http` sink:
+
+```bash
+ktranslate \
+  -format json \
+  -sinks http \
+  -http_url http://localhost:8082/ingest \
+  -snmp /etc/ktranslate/snmp.yaml
+```
+
+Open `http://localhost:8082/` in a browser. The page polls
+`/graph.json` every N seconds (adjustable in the toolbar). Devices are
+drawn as blue nodes with their interfaces clustered around them; links
+between interfaces are coloured by the discovery protocol (LLDP green,
+CDP yellow, both blue).
+
+Flags:
+
+- `-listen` — address to listen on (default `:8082`).
+- `-ttl` — drop links not seen within this window (default `2h`). Set
+  to `0` to disable pruning.
+
+Endpoints:
+
+- `POST /ingest` — ktranslate's HTTP sink target. Accepts JSON array
+  payloads and single objects, plus gzip. Non-topology records are
+  silently ignored so pointing a general JSON stream at it works.
+- `GET /graph.json` — current nodes+edges snapshot.
+- `GET /` — the HTML viewer (fully self-contained, no CDNs).
+- `GET /healthz` — liveness probe.
+
 # pprof
 To expose profiling endpoints, use the `-metalisten` flag. This can be used with tools such as
 `go tool pprof` to capture and view the data. For example, if `ktranslate` was started with

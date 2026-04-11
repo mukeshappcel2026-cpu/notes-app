@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ktranslate topology</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; font-family: ui-sans-serif, system-ui, sans-serif; background: #0b0f14; color: #e6edf3; }
+    #toolbar {
+      position: absolute; top: 0; left: 0; right: 0; height: 36px;
+      display: flex; align-items: center; gap: 16px; padding: 0 16px;
+      background: #111820; border-bottom: 1px solid #1f2a38; z-index: 5;
+      font-size: 13px;
+    }
+    #toolbar .stat { color: #9fb3c8; }
+    #toolbar .stat b { color: #e6edf3; }
+    #toolbar label { color: #9fb3c8; }
+    #toolbar input[type=range] { vertical-align: middle; }
+    #graph { position: absolute; top: 36px; left: 0; right: 0; bottom: 0; }
+    svg { width: 100%; height: 100%; display: block; }
+    .device circle { fill: #1f6feb; stroke: #58a6ff; stroke-width: 2px; }
+    .device text { fill: #e6edf3; font-size: 13px; font-weight: 600; pointer-events: none; }
+    .interface circle { fill: #2d333b; stroke: #6e7681; stroke-width: 1px; }
+    .interface text { fill: #9fb3c8; font-size: 10px; pointer-events: none; }
+    .link { stroke: #8b949e; stroke-width: 1.5px; }
+    .link.lldp { stroke: #3fb950; }
+    .link.cdp { stroke: #d29922; }
+    .link.both { stroke: #58a6ff; stroke-width: 2.5px; }
+    .hover text { font-weight: 700; fill: #fff; }
+    #tooltip {
+      position: absolute; pointer-events: none; background: #161b22;
+      border: 1px solid #30363d; padding: 6px 10px; font-size: 12px;
+      border-radius: 4px; color: #e6edf3; max-width: 260px; display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <div class="stat">devices: <b id="st-devices">0</b></div>
+    <div class="stat">links: <b id="st-links">0</b></div>
+    <div class="stat">updated: <b id="st-updated">—</b></div>
+    <label>refresh
+      <input id="refresh" type="range" min="2" max="60" value="10" step="1">
+      <b id="refreshLabel">10s</b>
+    </label>
+    <div class="stat" style="margin-left:auto">
+      legend:
+      <span style="color:#3fb950">lldp</span>
+      <span style="color:#d29922">cdp</span>
+      <span style="color:#58a6ff">both</span>
+    </div>
+  </div>
+  <div id="graph">
+    <svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg>
+  </div>
+  <div id="tooltip"></div>
+
+<script>
+/*
+ * Topology renderer — vanilla JS + SVG force-directed layout.
+ *
+ * Data source: GET /graph.json returns { nodes: [...], edges: [...] }
+ * produced by the Go backend's Snapshot method. We poll it on an
+ * interval, diff it into the simulation state, and run a small physics
+ * loop to place nodes.
+ */
+
+const svg = document.getElementById('svg');
+const tooltip = document.getElementById('tooltip');
+const stDevices = document.getElementById('st-devices');
+const stLinks = document.getElementById('st-links');
+const stUpdated = document.getElementById('st-updated');
+const refreshInput = document.getElementById('refresh');
+const refreshLabel = document.getElementById('refreshLabel');
+
+let W = svg.clientWidth || window.innerWidth;
+let H = svg.clientHeight || window.innerHeight;
+function onResize() {
+  W = svg.clientWidth || window.innerWidth;
+  H = svg.clientHeight || window.innerHeight;
+}
+window.addEventListener('resize', onResize);
+
+// Simulation state.
+let nodes = new Map();   // id -> { id, x, y, vx, vy, meta }
+let edges = [];          // [{ id, source, target, sources, meta }]
+let dragging = null;
+
+// SVG layers (edges behind nodes).
+const edgesLayer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+const nodesLayer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+svg.appendChild(edgesLayer);
+svg.appendChild(nodesLayer);
+
+async function fetchGraph() {
+  try {
+    const resp = await fetch('/graph.json', { cache: 'no-store' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    ingest(data);
+    stDevices.textContent = data.counts ? data.counts.devices : 0;
+    stLinks.textContent = data.counts ? data.counts.links : 0;
+    stUpdated.textContent = new Date(data.generated_at).toLocaleTimeString();
+  } catch (e) {
+    stUpdated.textContent = 'error: ' + e.message;
+  }
+}
+
+function ingest(data) {
+  const incomingIds = new Set();
+  // Preserve positions for existing nodes; seed new ones near the centre
+  // with a small random offset so force layout can separate them.
+  for (const n of data.nodes) {
+    incomingIds.add(n.id);
+    const existing = nodes.get(n.id);
+    if (existing) {
+      existing.meta = n;
+    } else {
+      nodes.set(n.id, {
+        id: n.id,
+        x: W / 2 + (Math.random() - 0.5) * 100,
+        y: H / 2 + (Math.random() - 0.5) * 100,
+        vx: 0,
+        vy: 0,
+        meta: n,
+      });
+    }
+  }
+  for (const id of [...nodes.keys()]) {
+    if (!incomingIds.has(id)) nodes.delete(id);
+  }
+
+  edges = data.edges.map(e => ({
+    id: e.id,
+    source: e.source,
+    target: e.target,
+    sources: e.sources || [],
+    meta: e,
+  })).filter(e => nodes.has(e.source) && nodes.has(e.target));
+
+  rebuildDOM();
+}
+
+function rebuildDOM() {
+  edgesLayer.innerHTML = '';
+  nodesLayer.innerHTML = '';
+
+  for (const e of edges) {
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    line.setAttribute('class', 'link ' + linkClass(e.sources));
+    line.dataset.id = e.id;
+    line.addEventListener('mouseenter', ev => showTooltip(ev, edgeTooltip(e)));
+    line.addEventListener('mousemove', moveTooltip);
+    line.addEventListener('mouseleave', hideTooltip);
+    edgesLayer.appendChild(line);
+    e._el = line;
+  }
+
+  for (const node of nodes.values()) {
+    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    g.setAttribute('class', node.meta.kind);
+    const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    c.setAttribute('r', node.meta.kind === 'device' ? 16 : 6);
+    const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    t.textContent = node.meta.label;
+    t.setAttribute('text-anchor', 'middle');
+    t.setAttribute('dy', node.meta.kind === 'device' ? -22 : -10);
+    g.appendChild(c);
+    g.appendChild(t);
+    g.addEventListener('mouseenter', ev => showTooltip(ev, nodeTooltip(node.meta)));
+    g.addEventListener('mousemove', moveTooltip);
+    g.addEventListener('mouseleave', hideTooltip);
+    g.addEventListener('mousedown', ev => {
+      dragging = node;
+      ev.preventDefault();
+    });
+    nodesLayer.appendChild(g);
+    node._el = g;
+  }
+}
+
+function linkClass(srcs) {
+  if (!srcs || srcs.length === 0) return '';
+  if (srcs.length > 1) return 'both';
+  return srcs[0];
+}
+
+function nodeTooltip(m) {
+  const lines = ['<b>' + escape(m.label) + '</b>'];
+  if (m.kind === 'device') {
+    lines.push('type: device');
+    if (m.ip) lines.push('ip: ' + escape(m.ip));
+    if (m.sys_descr) lines.push('sysDescr: ' + escape(m.sys_descr));
+  } else {
+    lines.push('type: interface');
+    if (m.if_index) lines.push('ifIndex: ' + m.if_index);
+  }
+  return lines.join('<br>');
+}
+
+function edgeTooltip(e) {
+  return '<b>link</b><br>sources: ' + e.sources.join(', ');
+}
+
+function showTooltip(ev, html) {
+  tooltip.innerHTML = html;
+  tooltip.style.display = 'block';
+  moveTooltip(ev);
+}
+function moveTooltip(ev) {
+  tooltip.style.left = (ev.clientX + 12) + 'px';
+  tooltip.style.top = (ev.clientY + 12) + 'px';
+}
+function hideTooltip() { tooltip.style.display = 'none'; }
+
+function escape(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+window.addEventListener('mousemove', ev => {
+  if (dragging) {
+    const rect = svg.getBoundingClientRect();
+    dragging.x = ev.clientX - rect.left;
+    dragging.y = ev.clientY - rect.top;
+    dragging.vx = 0;
+    dragging.vy = 0;
+  }
+});
+window.addEventListener('mouseup', () => { dragging = null; });
+
+/*
+ * Physics loop.
+ * - Repulsion between every pair of nodes (Coulomb-like).
+ * - Spring attraction along every edge, with a stronger "glue" spring
+ *   from each interface to its parent device so ports stay clustered.
+ * - Centering force so the graph drifts toward the middle.
+ * - Velocity damping each tick.
+ */
+const REPULSION = 6000;
+const LINK_DIST = 120;
+const LINK_K = 0.02;
+const PARENT_DIST = 28;
+const PARENT_K = 0.08;
+const CENTER_K = 0.002;
+const DAMPING = 0.85;
+
+function tick() {
+  const nodeList = [...nodes.values()];
+
+  // Repulsion: O(n^2) but n is small for network topology use.
+  for (let i = 0; i < nodeList.length; i++) {
+    const a = nodeList[i];
+    for (let j = i + 1; j < nodeList.length; j++) {
+      const b = nodeList[j];
+      let dx = a.x - b.x;
+      let dy = a.y - b.y;
+      let dsq = dx * dx + dy * dy;
+      if (dsq < 1) dsq = 1;
+      const f = REPULSION / dsq;
+      const d = Math.sqrt(dsq);
+      const ux = dx / d, uy = dy / d;
+      a.vx += ux * f * 0.01;
+      a.vy += uy * f * 0.01;
+      b.vx -= ux * f * 0.01;
+      b.vy -= uy * f * 0.01;
+    }
+  }
+
+  // Edge springs.
+  for (const e of edges) {
+    const s = nodes.get(e.source);
+    const t = nodes.get(e.target);
+    if (!s || !t) continue;
+    const dx = t.x - s.x;
+    const dy = t.y - s.y;
+    const d = Math.sqrt(dx * dx + dy * dy) || 1;
+    const f = (d - LINK_DIST) * LINK_K;
+    const ux = dx / d, uy = dy / d;
+    s.vx += ux * f;
+    s.vy += uy * f;
+    t.vx -= ux * f;
+    t.vy -= uy * f;
+  }
+
+  // Parent-child "glue": interfaces attached to their device.
+  for (const node of nodeList) {
+    if (node.meta.kind !== 'interface' || !node.meta.parent) continue;
+    const p = nodes.get(node.meta.parent);
+    if (!p) continue;
+    const dx = p.x - node.x;
+    const dy = p.y - node.y;
+    const d = Math.sqrt(dx * dx + dy * dy) || 1;
+    const f = (d - PARENT_DIST) * PARENT_K;
+    const ux = dx / d, uy = dy / d;
+    node.vx += ux * f;
+    node.vy += uy * f;
+    p.vx -= ux * f * 0.3; // device is heavier
+    p.vy -= uy * f * 0.3;
+  }
+
+  // Centering.
+  for (const node of nodeList) {
+    node.vx += (W / 2 - node.x) * CENTER_K;
+    node.vy += (H / 2 - node.y) * CENTER_K;
+  }
+
+  // Integrate + damp.
+  for (const node of nodeList) {
+    if (node === dragging) continue;
+    node.vx *= DAMPING;
+    node.vy *= DAMPING;
+    node.x += node.vx;
+    node.y += node.vy;
+    // Keep everything on-screen.
+    const pad = 40;
+    if (node.x < pad) node.x = pad;
+    if (node.y < pad + 36) node.y = pad + 36;
+    if (node.x > W - pad) node.x = W - pad;
+    if (node.y > H - pad) node.y = H - pad;
+  }
+
+  render();
+  requestAnimationFrame(tick);
+}
+
+function render() {
+  for (const node of nodes.values()) {
+    if (!node._el) continue;
+    node._el.setAttribute('transform', 'translate(' + node.x + ',' + node.y + ')');
+  }
+  for (const e of edges) {
+    if (!e._el) continue;
+    const s = nodes.get(e.source);
+    const t = nodes.get(e.target);
+    if (!s || !t) continue;
+    e._el.setAttribute('x1', s.x);
+    e._el.setAttribute('y1', s.y);
+    e._el.setAttribute('x2', t.x);
+    e._el.setAttribute('y2', t.y);
+  }
+}
+
+// Kick off the loop, initial fetch, and refresh timer.
+let refreshMs = 10000;
+refreshInput.addEventListener('input', () => {
+  refreshMs = parseInt(refreshInput.value, 10) * 1000;
+  refreshLabel.textContent = refreshInput.value + 's';
+  resetRefresh();
+});
+
+let refreshTimer = null;
+function resetRefresh() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(fetchGraph, refreshMs);
+}
+
+fetchGraph().then(() => {
+  requestAnimationFrame(tick);
+  resetRefresh();
+});
+</script>
+</body>
+</html>
