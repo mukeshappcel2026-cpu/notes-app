@@ -1,0 +1,429 @@
+From 91245bc1f11c1845c013d1e4996b2b083da67d3e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 11 Apr 2026 17:42:53 +0000
+Subject: [PATCH 9/9] ktranslate-topology: add -demo flag with simulated
+ enterprise topology
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a built-in demo seeder so the viewer can be exercised without
+running SNMP against real gear. Pass -demo to seed a realistic
+three-tier enterprise network and a goroutine refreshes the link
+timestamps on a configurable interval (-demo-interval, default 10s)
+so the viewer's auto-refresh clock stays live.
+
+The fixture in demo.go defines 17 devices and 19 links:
+
+  - 2 core routers (core-r1/r2) with an HSRP mesh
+  - 3 distribution switches fully meshed to both cores
+  - 6 access switches hanging off the distribution tier
+  - 6 edge devices: two IP phones, two APs, a Linux server,
+    a Windows workstation
+
+Each device has a realistic Catalyst/ASR/AP sysDescr and a plausible
+IP that show up in the node tooltips. Protocol coverage is mixed on
+purpose so every colour of edge renders:
+
+  - core mesh + core-to-dist: LLDP + CDP (blue, merged)
+  - dist-to-access:           LLDP only (green)
+  - phones, one AP:           CDP only (yellow)
+  - one AP:                   LLDP + CDP (blue)
+
+Each demoLink produces two Observations (one per endpoint) so the
+graph store's reciprocal-view dedup path is exercised end-to-end —
+38 observations collapse into 19 canonical edges.
+
+Unit tests verify the seeded shape (17/19), that the lldp+cdp merge
+lands on the expected link, that every interface is attached to a
+real device parent, and that dist-to-access edges are lldp-only.
+
+Usage:
+
+  ./ktranslate-topology -listen :8082 -demo
+  open http://localhost:8082/
+---
+ README.md                            |  27 +++++
+ cmd/ktranslate-topology/demo.go      | 148 +++++++++++++++++++++++++++
+ cmd/ktranslate-topology/demo_test.go | 132 ++++++++++++++++++++++++
+ cmd/ktranslate-topology/main.go      |  18 +++-
+ 4 files changed, 323 insertions(+), 2 deletions(-)
+ create mode 100644 vendor/ktranslate/cmd/ktranslate-topology/demo.go
+ create mode 100644 vendor/ktranslate/cmd/ktranslate-topology/demo_test.go
+
+diff --git a/README.md b/README.md
+index e020a35..7451d8e 100644
+--- a/README.md
++++ b/README.md
+@@ -314,6 +314,33 @@ Flags:
+ - `-listen` — address to listen on (default `:8082`).
+ - `-ttl` — drop links not seen within this window (default `2h`). Set
+   to `0` to disable pruning.
++- `-demo` — seed a simulated 17-device, 19-link enterprise topology
++  into the graph on startup instead of waiting for real ingest. Use
++  this to try the viewer without running SNMP against real gear.
++- `-demo-interval` — how often demo mode refreshes its link timestamps
++  (default `10s`). Keeps the viewer's "updated" clock ticking.
++
++### Trying it without real devices
++
++```bash
++go build -o ktranslate-topology ./cmd/ktranslate-topology
++./ktranslate-topology -listen :8082 -demo
++```
++
++Open `http://localhost:8082/` in a browser. You'll see a fully wired
++3-tier network:
++
++- **2 core routers** (`core-r1`, `core-r2`) with an HSRP-style mesh link
++- **3 distribution switches** (`dist-sw1..3`) fully meshed to both cores
++- **6 access switches** (`acc-sw1..6`) hanging off the distribution tier
++- **6 edge devices** — two IP phones, two wireless APs, a Linux server,
++  a Windows workstation — attached to various access switches
++
++Protocol coverage is mixed on purpose: core links are reported by both
++LLDP and CDP (blue), dist-to-access is LLDP-only (green), phones and
++one AP are CDP-only (yellow), and one access-to-AP link uses both so
++the merge path lights up. Every device has a realistic sysDescr and IP
++that show up in the node tooltips.
+ 
+ Endpoints:
+ 
+diff --git a/cmd/ktranslate-topology/demo.go b/cmd/ktranslate-topology/demo.go
+new file mode 100644
+index 0000000..26aba42
+--- /dev/null
++++ b/cmd/ktranslate-topology/demo.go
+@@ -0,0 +1,148 @@
++package main
++
++import (
++	"context"
++	"time"
++)
++
++// demoDevice describes one simulated device. IP and sysDescr flow into
++// the graph via Observation.LocalDeviceIP / LocalSysDescr when the device
++// appears as the local side of an observation, so every device in the
++// fixture must appear as the local side of at least one link.
++type demoDevice struct {
++	Name     string
++	IP       string
++	SysDescr string
++}
++
++// demoLink describes a simulated adjacency. A single entry produces two
++// observations (one per endpoint) which the graph store collapses into a
++// single edge via its canonical link id. Sources can be {"lldp"},
++// {"cdp"}, or {"lldp","cdp"} to exercise the LLDP/CDP merge path.
++type demoLink struct {
++	A, B     string // device names
++	AIf, BIf string // interface names
++	AIdx     int64  // ifIndex on A's side
++	BIdx     int64  // ifIndex on B's side
++	Sources  []string
++}
++
++// demoDevices is a realistic mix of core routers, distribution and access
++// switches, plus edge devices (phones, APs, a server, a workstation). IPs
++// and sysDescr strings mirror what a real SNMP poll of Cisco gear would
++// return so the tooltips in the viewer look authentic.
++var demoDevices = []demoDevice{
++	{"core-r1", "10.0.0.1", "Cisco IOS XE Software, ASR 1001-HX, Version 17.09.03"},
++	{"core-r2", "10.0.0.2", "Cisco IOS XE Software, ASR 1001-HX, Version 17.09.03"},
++
++	{"dist-sw1", "10.0.10.1", "Cisco IOS Software, Catalyst 9500, Version 17.09"},
++	{"dist-sw2", "10.0.10.2", "Cisco IOS Software, Catalyst 9500, Version 17.09"},
++	{"dist-sw3", "10.0.10.3", "Cisco IOS Software, Catalyst 9500, Version 17.09"},
++
++	{"acc-sw1", "10.0.20.1", "Cisco IOS Software, Catalyst 9300, Version 17.09"},
++	{"acc-sw2", "10.0.20.2", "Cisco IOS Software, Catalyst 9300, Version 17.09"},
++	{"acc-sw3", "10.0.20.3", "Cisco IOS Software, Catalyst 9300, Version 17.09"},
++	{"acc-sw4", "10.0.20.4", "Cisco IOS Software, Catalyst 9300, Version 17.09"},
++	{"acc-sw5", "10.0.20.5", "Cisco IOS Software, Catalyst 9300, Version 17.09"},
++	{"acc-sw6", "10.0.20.6", "Cisco IOS Software, Catalyst 9300, Version 17.09"},
++
++	{"phone-1", "10.0.30.10", "Cisco IP Phone 8841"},
++	{"phone-2", "10.0.30.11", "Cisco IP Phone 8841"},
++	{"ap-1", "10.0.30.20", "Cisco Aironet AP2802i Version 17.09"},
++	{"ap-2", "10.0.30.21", "Cisco Aironet AP2802i Version 17.09"},
++	{"srv-1", "10.0.30.30", "Linux srv-1 6.1.0 x86_64 (lldpd)"},
++	{"ws-1", "10.0.30.40", "Windows 11 Pro workstation"},
++}
++
++// demoLinks describes the adjacency graph. Core routers carry an HSRP
++// mesh; the core-to-distribution fabric is fully meshed (each core talks
++// to every dist); dist-to-access is hierarchical; access-to-edge has a
++// single uplink per edge device.
++var demoLinks = []demoLink{
++	// Core mesh
++	{A: "core-r1", AIf: "Ten0/0/0", AIdx: 1, B: "core-r2", BIf: "Ten0/0/0", BIdx: 1, Sources: []string{"lldp", "cdp"}},
++
++	// Core -> Distribution (full mesh)
++	{A: "core-r1", AIf: "Ten0/1/0", AIdx: 2, B: "dist-sw1", BIf: "Ten1/1/1", BIdx: 101, Sources: []string{"lldp", "cdp"}},
++	{A: "core-r1", AIf: "Ten0/1/1", AIdx: 3, B: "dist-sw2", BIf: "Ten1/1/1", BIdx: 101, Sources: []string{"lldp", "cdp"}},
++	{A: "core-r1", AIf: "Ten0/1/2", AIdx: 4, B: "dist-sw3", BIf: "Ten1/1/1", BIdx: 101, Sources: []string{"lldp", "cdp"}},
++	{A: "core-r2", AIf: "Ten0/1/0", AIdx: 2, B: "dist-sw1", BIf: "Ten1/1/2", BIdx: 102, Sources: []string{"lldp", "cdp"}},
++	{A: "core-r2", AIf: "Ten0/1/1", AIdx: 3, B: "dist-sw2", BIf: "Ten1/1/2", BIdx: 102, Sources: []string{"lldp", "cdp"}},
++	{A: "core-r2", AIf: "Ten0/1/2", AIdx: 4, B: "dist-sw3", BIf: "Ten1/1/2", BIdx: 102, Sources: []string{"lldp", "cdp"}},
++
++	// Distribution -> Access (LLDP-only, common in greenfield fabrics)
++	{A: "dist-sw1", AIf: "Ten1/2/1", AIdx: 201, B: "acc-sw1", BIf: "Ten1/1/49", BIdx: 149, Sources: []string{"lldp"}},
++	{A: "dist-sw1", AIf: "Ten1/2/2", AIdx: 202, B: "acc-sw2", BIf: "Ten1/1/49", BIdx: 149, Sources: []string{"lldp"}},
++	{A: "dist-sw2", AIf: "Ten1/2/1", AIdx: 201, B: "acc-sw3", BIf: "Ten1/1/49", BIdx: 149, Sources: []string{"lldp"}},
++	{A: "dist-sw2", AIf: "Ten1/2/2", AIdx: 202, B: "acc-sw4", BIf: "Ten1/1/49", BIdx: 149, Sources: []string{"lldp"}},
++	{A: "dist-sw3", AIf: "Ten1/2/1", AIdx: 201, B: "acc-sw5", BIf: "Ten1/1/49", BIdx: 149, Sources: []string{"lldp"}},
++	{A: "dist-sw3", AIf: "Ten1/2/2", AIdx: 202, B: "acc-sw6", BIf: "Ten1/1/49", BIdx: 149, Sources: []string{"lldp"}},
++
++	// Access -> Edge
++	{A: "acc-sw1", AIf: "Gi1/0/1", AIdx: 1, B: "phone-1", BIf: "SW-1", BIdx: 1, Sources: []string{"cdp"}},
++	{A: "acc-sw2", AIf: "Gi1/0/1", AIdx: 1, B: "phone-2", BIf: "SW-1", BIdx: 1, Sources: []string{"cdp"}},
++	{A: "acc-sw2", AIf: "Gi1/0/2", AIdx: 2, B: "ws-1", BIf: "eth0", BIdx: 1, Sources: []string{"lldp"}},
++	{A: "acc-sw3", AIf: "Gi1/0/1", AIdx: 1, B: "srv-1", BIf: "eth0", BIdx: 1, Sources: []string{"lldp"}},
++	{A: "acc-sw4", AIf: "Gi1/0/1", AIdx: 1, B: "ap-1", BIf: "GigabitEthernet0", BIdx: 1, Sources: []string{"cdp"}},
++	{A: "acc-sw5", AIf: "Gi1/0/1", AIdx: 1, B: "ap-2", BIf: "GigabitEthernet0", BIdx: 1, Sources: []string{"lldp", "cdp"}},
++}
++
++// seedDemo applies every link in the fixture to the graph. Each link
++// produces two observations (one per endpoint) so reciprocal-view
++// deduping and metadata propagation both get exercised.
++func seedDemo(g *Graph, now time.Time) {
++	devByName := make(map[string]demoDevice, len(demoDevices))
++	for _, d := range demoDevices {
++		devByName[d.Name] = d
++	}
++
++	emit := func(local, remote demoDevice, localIf, remoteIf string, localIdx int64, sources []string) {
++		g.Apply(Observation{
++			LocalDevice:     local.Name,
++			LocalDeviceIP:   local.IP,
++			LocalSysDescr:   local.SysDescr,
++			LocalIfName:     localIf,
++			LocalIfIndex:    localIdx,
++			RemoteDevice:    remote.Name,
++			RemoteIfName:    remoteIf,
++			RemoteMgmtAddr:  remote.IP,
++			NeighborSources: sources,
++			Timestamp:       now,
++		})
++	}
++
++	for _, link := range demoLinks {
++		a, okA := devByName[link.A]
++		b, okB := devByName[link.B]
++		if !okA || !okB {
++			continue
++		}
++		// One observation per endpoint -- the graph store collapses them
++		// into a single edge, with Sources merged.
++		emit(a, b, link.AIf, link.BIf, link.AIdx, link.Sources)
++		emit(b, a, link.BIf, link.AIf, link.BIdx, link.Sources)
++	}
++}
++
++// runDemo seeds the graph once, then refreshes it on a timer so the
++// viewer's auto-refresh shows a "live" updated_at timestamp. The
++// function returns when ctx is cancelled.
++func runDemo(ctx context.Context, g *Graph, interval time.Duration, now func() time.Time) {
++	if interval <= 0 {
++		interval = 10 * time.Second
++	}
++	if now == nil {
++		now = time.Now
++	}
++	seedDemo(g, now())
++	t := time.NewTicker(interval)
++	defer t.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-t.C:
++			seedDemo(g, now())
++		}
++	}
++}
+diff --git a/cmd/ktranslate-topology/demo_test.go b/cmd/ktranslate-topology/demo_test.go
+new file mode 100644
+index 0000000..c293d92
+--- /dev/null
++++ b/cmd/ktranslate-topology/demo_test.go
+@@ -0,0 +1,132 @@
++package main
++
++import (
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestSeedDemo_ProducesExpectedShape(t *testing.T) {
++	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
++	g := NewGraph(time.Hour)
++	g.now = fixedTime(now)
++
++	seedDemo(g, now)
++	snap := g.Snapshot()
++
++	if got, want := snap.Counts["devices"], len(demoDevices); got != want {
++		t.Errorf("devices: want %d, got %d", want, got)
++	}
++	if got, want := snap.Counts["links"], len(demoLinks); got != want {
++		t.Errorf("links: want %d (one per demoLink entry after dedup), got %d", want, got)
++	}
++
++	// Every device must show up as a "device" node with an IP populated.
++	// If metadata propagation broke this would catch it.
++	byLabel := make(map[string]SnapshotNode, len(snap.Nodes))
++	for _, n := range snap.Nodes {
++		if n.Kind == "device" {
++			byLabel[n.Label] = n
++		}
++	}
++	for _, d := range demoDevices {
++		n, ok := byLabel[d.Name]
++		if !ok {
++			t.Errorf("device %q missing from snapshot", d.Name)
++			continue
++		}
++		if n.IP != d.IP {
++			t.Errorf("device %q: want IP %q, got %q", d.Name, d.IP, n.IP)
++		}
++		if n.SysDescr != d.SysDescr {
++			t.Errorf("device %q: sysDescr missing or wrong", d.Name)
++		}
++	}
++}
++
++func TestSeedDemo_MergesLLDPAndCDPOnSameLink(t *testing.T) {
++	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
++	g := NewGraph(time.Hour)
++	g.now = fixedTime(now)
++
++	seedDemo(g, now)
++	snap := g.Snapshot()
++
++	// The ap-2 link is defined with {"lldp","cdp"} so both protocols
++	// should show up on its single collapsed edge.
++	var found bool
++	for _, e := range snap.Edges {
++		if strings.Contains(e.ID, "ap-2") {
++			found = true
++			if len(e.Sources) != 2 {
++				t.Errorf("ap-2 edge: want 2 sources, got %v", e.Sources)
++			}
++			hasLLDP, hasCDP := false, false
++			for _, s := range e.Sources {
++				if s == "lldp" {
++					hasLLDP = true
++				}
++				if s == "cdp" {
++					hasCDP = true
++				}
++			}
++			if !hasLLDP || !hasCDP {
++				t.Errorf("ap-2 edge sources missing one: %v", e.Sources)
++			}
++		}
++	}
++	if !found {
++		t.Error("ap-2 edge missing from snapshot")
++	}
++}
++
++func TestSeedDemo_InterfacesAreAttachedToParents(t *testing.T) {
++	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
++	g := NewGraph(time.Hour)
++	g.now = fixedTime(now)
++
++	seedDemo(g, now)
++	snap := g.Snapshot()
++
++	deviceIDs := make(map[string]struct{})
++	for _, n := range snap.Nodes {
++		if n.Kind == "device" {
++			deviceIDs[n.ID] = struct{}{}
++		}
++	}
++
++	// Every interface node must reference a real device parent.
++	for _, n := range snap.Nodes {
++		if n.Kind != "interface" {
++			continue
++		}
++		if n.Parent == "" {
++			t.Errorf("interface %q has no parent", n.Label)
++			continue
++		}
++		if _, ok := deviceIDs[n.Parent]; !ok {
++			t.Errorf("interface %q references missing parent %q", n.Label, n.Parent)
++		}
++	}
++}
++
++func TestSeedDemo_DistAccessLinksAreLLDPOnly(t *testing.T) {
++	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
++	g := NewGraph(time.Hour)
++	g.now = fixedTime(now)
++
++	seedDemo(g, now)
++	snap := g.Snapshot()
++
++	// Spot check: a dist-to-access link should be tagged lldp only, to
++	// exercise the single-source render path.
++	for _, e := range snap.Edges {
++		if strings.Contains(e.ID, "dist-sw1") && strings.Contains(e.ID, "acc-sw1") {
++			if len(e.Sources) != 1 || e.Sources[0] != "lldp" {
++				t.Errorf("dist-sw1<->acc-sw1: want [lldp], got %v", e.Sources)
++			}
++			return
++		}
++	}
++	t.Error("expected dist-sw1<->acc-sw1 edge not found")
++}
+diff --git a/cmd/ktranslate-topology/main.go b/cmd/ktranslate-topology/main.go
+index 5c4cb11..1661974 100644
+--- a/cmd/ktranslate-topology/main.go
++++ b/cmd/ktranslate-topology/main.go
+@@ -26,8 +26,10 @@ import (
+ 
+ func main() {
+ 	var (
+-		listen = flag.String("listen", ":8082", "address to listen on for ingest + UI")
+-		ttl    = flag.Duration("ttl", 2*time.Hour, "drop links not seen within this window")
++		listen       = flag.String("listen", ":8082", "address to listen on for ingest + UI")
++		ttl          = flag.Duration("ttl", 2*time.Hour, "drop links not seen within this window")
++		demo         = flag.Bool("demo", false, "seed a simulated enterprise topology instead of waiting for real ingest")
++		demoInterval = flag.Duration("demo-interval", 10*time.Second, "how often the demo seeder refreshes link timestamps")
+ 	)
+ 	flag.Parse()
+ 
+@@ -44,6 +46,17 @@ func main() {
+ 
+ 	logger.Printf("listening on %s (link ttl: %s)", *listen, ttl)
+ 
++	// Demo mode: spin up a goroutine that seeds synthetic topology into
++	// the graph on a timer. The goroutine exits when demoCtx is cancelled
++	// (either on SIGINT/SIGTERM or when http.ErrServerClosed comes back).
++	demoCtx, cancelDemo := context.WithCancel(context.Background())
++	defer cancelDemo()
++	if *demo {
++		logger.Printf("demo mode enabled: seeding %d devices, %d links every %s",
++			len(demoDevices), len(demoLinks), demoInterval)
++		go runDemo(demoCtx, g, *demoInterval, time.Now)
++	}
++
+ 	// Run the HTTP server in a goroutine so we can react to signals.
+ 	errCh := make(chan error, 1)
+ 	go func() {
+@@ -66,6 +79,7 @@ func main() {
+ 		return
+ 	}
+ 
++	cancelDemo()
+ 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+ 	defer cancel()
+ 	if err := httpSrv.Shutdown(ctx); err != nil {
+-- 
+2.43.0
+
