@@ -53,7 +53,7 @@ func TestParseCDPNeighbors_TwoNeighbors(t *testing.T) {
 		cdpPDU("6", "3", "1", gosnmp.OctetString, []byte("switch-b.example.net")),
 		cdpPDU("7", "3", "1", gosnmp.OctetString, []byte("GigabitEthernet0/24")),
 		cdpPDU("8", "3", "1", gosnmp.OctetString, []byte("cisco WS-C3750")),
-		cdpPDU("9", "3", "1", gosnmp.OctetString, []byte{0x00, 0x00, 0x00, 0x28}),
+		cdpPDU("9", "3", "1", gosnmp.OctetString, []byte{0x00, 0x00, 0x00, 0x28}), // switch + igmp-conditional
 
 		// Neighbor on ifIndex=10, devIdx=1 — a phone.
 		cdpPDU("4", "10", "1", gosnmp.OctetString, []byte{10, 0, 0, 3}),
@@ -74,7 +74,7 @@ func TestParseCDPNeighbors_TwoNeighbors(t *testing.T) {
 		assert.Equal(t, "switch-b.example.net", n0.RemoteChassisID)
 		assert.Equal(t, "GigabitEthernet0/24", n0.RemotePortID)
 		assert.Equal(t, "cisco WS-C3750", n0.RemotePlatform)
-		assert.Equal(t, "0x00000028", n0.RemoteCapabilities)
+		assert.Equal(t, "switch,igmp-conditional", n0.RemoteCapabilities)
 
 		n1 := got[1]
 		assert.EqualValues(t, 10, n1.LocalIfIndex)
@@ -114,6 +114,51 @@ func lldpRemPDU(col, timeMark, locPort, remIdx string, t gosnmp.Asn1BER, v inter
 		Type:  t,
 		Value: v,
 	}
+}
+
+func TestDecodeLLDPCapabilities(t *testing.T) {
+	// bridge + router
+	got, ok := decodeLLDPCapabilities(gosnmp.SnmpPDU{Type: gosnmp.OctetString, Value: []byte{0x28}})
+	assert.True(t, ok)
+	assert.Equal(t, "bridge,router", got)
+
+	// all 8 bits set
+	got, ok = decodeLLDPCapabilities(gosnmp.SnmpPDU{Type: gosnmp.OctetString, Value: []byte{0xff}})
+	assert.True(t, ok)
+	assert.Equal(t, "other,repeater,bridge,wlan-ap,router,telephone,docsis,station-only", got)
+
+	// Nothing set in byte 0 but bits in byte 1 that fall outside the named
+	// range — falls back to hex so the caller still sees something.
+	got, ok = decodeLLDPCapabilities(gosnmp.SnmpPDU{Type: gosnmp.OctetString, Value: []byte{0x00, 0x14}})
+	assert.True(t, ok)
+	assert.Equal(t, "0x0014", got)
+
+	// Wrong ASN.1 type.
+	_, ok = decodeLLDPCapabilities(gosnmp.SnmpPDU{Type: gosnmp.Integer, Value: 1})
+	assert.False(t, ok)
+}
+
+func TestDecodeCDPCapabilities(t *testing.T) {
+	// router + switch (0x01 | 0x08)
+	got, ok := decodeCDPCapabilities(gosnmp.SnmpPDU{Type: gosnmp.OctetString, Value: []byte{0x00, 0x00, 0x00, 0x09}})
+	assert.True(t, ok)
+	assert.Equal(t, "router,switch", got)
+
+	// Phone (bit 7) + remotely-managed (bit 8) — exercises the high byte.
+	got, ok = decodeCDPCapabilities(gosnmp.SnmpPDU{Type: gosnmp.OctetString, Value: []byte{0x00, 0x00, 0x01, 0x80}})
+	assert.True(t, ok)
+	assert.Equal(t, "phone,remotely-managed", got)
+
+	// Unknown bit (bit 15) with nothing named set — hex fallback.
+	got, ok = decodeCDPCapabilities(gosnmp.SnmpPDU{Type: gosnmp.OctetString, Value: []byte{0x00, 0x00, 0x80, 0x00}})
+	assert.True(t, ok)
+	assert.Equal(t, "0x00008000", got)
+
+	// Empty / wrong type.
+	_, ok = decodeCDPCapabilities(gosnmp.SnmpPDU{Type: gosnmp.OctetString, Value: []byte{}})
+	assert.False(t, ok)
+	_, ok = decodeCDPCapabilities(gosnmp.SnmpPDU{Type: gosnmp.Integer, Value: 1})
+	assert.False(t, ok)
 }
 
 func TestFormatMAC(t *testing.T) {
@@ -197,7 +242,7 @@ func TestParseLLDPNeighbors_InterfaceNameResolution(t *testing.T) {
 		lldpRemPDU("8", "5", "1", "1", gosnmp.OctetString, []byte("uplink to core")),
 		lldpRemPDU("9", "5", "1", "1", gosnmp.OctetString, []byte("core-a.example.net")),
 		lldpRemPDU("10", "5", "1", "1", gosnmp.OctetString, []byte("Cisco IOS core-a")),
-		lldpRemPDU("12", "5", "1", "1", gosnmp.OctetString, []byte{0x00, 0x14}),
+		lldpRemPDU("12", "5", "1", "1", gosnmp.OctetString, []byte{0x28}), // bridge + router
 
 		// local port 2, timeMark 5, rem index 1 — a server
 		lldpRemPDU("4", "5", "2", "1", gosnmp.Integer, 4),
@@ -218,7 +263,7 @@ func TestParseLLDPNeighbors_InterfaceNameResolution(t *testing.T) {
 		assert.Equal(t, "Cisco IOS core-a", n0.RemoteSysDesc)
 		assert.Equal(t, "GigabitEthernet0/24", n0.RemotePortID)
 		assert.Equal(t, "uplink to core", n0.RemotePortDesc)
-		assert.Equal(t, "0x0014", n0.RemoteCapabilities)
+		assert.Equal(t, "bridge,router", n0.RemoteCapabilities)
 
 		n1 := got[1]
 		assert.EqualValues(t, 102, n1.LocalIfIndex)

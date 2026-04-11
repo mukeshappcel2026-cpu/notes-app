@@ -351,7 +351,7 @@ func parseLLDPNeighbors(pdus []gosnmp.SnmpPDU, base string, locPorts map[string]
 				s.n.RemoteSysDesc = v
 			}
 		case "12":
-			if v, ok := decodeCapabilityBits(pdu); ok {
+			if v, ok := decodeLLDPCapabilities(pdu); ok {
 				s.n.RemoteCapabilities = v
 			}
 		}
@@ -602,7 +602,7 @@ func parseCDPNeighbors(pdus []gosnmp.SnmpPDU, base string, ifaces map[string]*kt
 				n.RemotePlatform = s
 			}
 		case "9": // cdpCacheCapabilities
-			if s, ok := decodeCapabilityBits(pdu); ok {
+			if s, ok := decodeCDPCapabilities(pdu); ok {
 				n.RemoteCapabilities = s
 			}
 		}
@@ -664,10 +664,27 @@ func decodeCDPAddress(pdu gosnmp.SnmpPDU) (string, bool) {
 	}
 }
 
-// decodeCapabilityBits renders a bit-packed capability octet-string as a
-// lowercase hex token. Callers that want semantic decoding can split the
-// result back out; for now we just surface the raw bits so nothing is lost.
-func decodeCapabilityBits(pdu gosnmp.SnmpPDU) (string, bool) {
+// lldpCapNames maps each defined bit in lldpRemSysCapEnabled to its
+// IEEE 802.1AB short name. The zero-indexed bit numbers follow the SMIv2
+// BITS convention where bit 0 is the most-significant bit of the first
+// octet. Order matters for decoded output: we walk the slice in bit-index
+// order so the rendered list is stable.
+var lldpCapNames = []string{
+	"other",
+	"repeater",
+	"bridge",
+	"wlan-ap",
+	"router",
+	"telephone",
+	"docsis",
+	"station-only",
+}
+
+// decodeLLDPCapabilities renders lldpRemSysCapEnabled (a BITS octet string)
+// as a comma-joined list of capability names, e.g. "bridge,router". When
+// none of the known bits are set the raw bytes are surfaced as a hex token
+// so callers don't lose vendor extensions.
+func decodeLLDPCapabilities(pdu gosnmp.SnmpPDU) (string, bool) {
 	if pdu.Type != gosnmp.OctetString {
 		return "", false
 	}
@@ -675,7 +692,66 @@ func decodeCapabilityBits(pdu gosnmp.SnmpPDU) (string, bool) {
 	if !ok || len(b) == 0 {
 		return "", false
 	}
-	return "0x" + hex.EncodeToString(b), true
+	names := make([]string, 0, len(lldpCapNames))
+	for bit, name := range lldpCapNames {
+		byteIdx := bit / 8
+		if byteIdx >= len(b) {
+			break
+		}
+		mask := byte(0x80 >> (bit % 8))
+		if b[byteIdx]&mask != 0 {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return "0x" + hex.EncodeToString(b), true
+	}
+	return strings.Join(names, ","), true
+}
+
+// cdpCapNames maps each defined bit in cdpCacheCapabilities to its CISCO-CDP
+// short name. Per the MIB, bits are numbered LSB-first in the LAST byte of
+// a 4-octet value, so bit 0 = 0x01, bit 1 = 0x02, … bit 7 = 0x80, with
+// bit 8 moving into the next byte down. We interpret the octet string as
+// a big-endian integer to sidestep the ordering.
+var cdpCapNames = []string{
+	"router",
+	"trans-bridge",
+	"source-route-bridge",
+	"switch",
+	"host",
+	"igmp-conditional",
+	"repeater",
+	"phone",
+	"remotely-managed",
+	"cvta",
+}
+
+// decodeCDPCapabilities renders cdpCacheCapabilities as a comma-joined list
+// of capability names, falling back to hex when no known bits are set.
+func decodeCDPCapabilities(pdu gosnmp.SnmpPDU) (string, bool) {
+	if pdu.Type != gosnmp.OctetString {
+		return "", false
+	}
+	b, ok := pdu.Value.([]byte)
+	if !ok || len(b) == 0 {
+		return "", false
+	}
+	// Interpret the first up-to-8 bytes as a big-endian unsigned integer.
+	var v uint64
+	for _, byt := range b {
+		v = v<<8 | uint64(byt)
+	}
+	names := make([]string, 0, len(cdpCapNames))
+	for bit, name := range cdpCapNames {
+		if v&(1<<uint(bit)) != 0 {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return "0x" + hex.EncodeToString(b), true
+	}
+	return strings.Join(names, ","), true
 }
 
 // mergeNeighbors collapses adjacent records that refer to the same link but

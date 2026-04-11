@@ -266,8 +266,8 @@ except `local_if_index` which lands in `custom_bigint`):
 | `remote_port_id` | Remote port identifier |
 | `remote_port_desc` | Remote port description |
 | `remote_platform` | CDP platform string (e.g. `cisco WS-C3750`) |
-| `remote_mgmt_addr` | Management address advertised by the neighbor |
-| `remote_capabilities` | Capability bitmap as `0x…` |
+| `remote_mgmt_addr` | Management address advertised by the neighbor (IPv4 / IPv6 string, filled for CDP and for LLDP when `lldpRemManAddrEntry` is available) |
+| `remote_capabilities` | Capability set rendered as a comma-joined name list (e.g. `bridge,router` for LLDP, `router,switch` for CDP), or `0x…` when no known bits are set |
 
 Because the records flow through the existing metadata path, every
 downstream format and sink (JSON/NRM/OTEL/Prom/Kafka/New Relic/…) picks
