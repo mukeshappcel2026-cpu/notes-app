@@ -2,6 +2,10 @@ package metadata
 
 import (
 	"context"
+	"encoding/hex"
+	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/gosnmp/gosnmp"
 
@@ -95,18 +99,164 @@ func pollLLDPNeighbors(ctx context.Context, conf *kt.SnmpDeviceConfig, server *g
 	_ = server
 	_ = ifaces
 	_ = log
-	_ = snmp_util.WalkOID // keep the import hooked up for Stage 3
 	return nil, nil
 }
 
-// pollCDPNeighbors is a stub until Stage 2.
+// pollCDPNeighbors walks the cdpCacheTable and returns any discovered
+// neighbors. The ifaces map is used purely to enrich the neighbor records
+// with a local interface name (ifDescr); resolving the local ifIndex is
+// free for CDP because it's part of the cdpCacheEntry index.
 func pollCDPNeighbors(ctx context.Context, conf *kt.SnmpDeviceConfig, server *gosnmp.GoSNMP, ifaces map[string]*kt.InterfaceData, log logger.ContextL) ([]kt.TopologyNeighbor, error) {
-	_ = ctx
-	_ = conf
-	_ = server
-	_ = ifaces
-	_ = log
-	return nil, nil
+	pdus, err := snmp_util.WalkOID(ctx, conf, oidCDPCacheTable, server, log, "CDPCache")
+	if err != nil {
+		return nil, err
+	}
+	return parseCDPNeighbors(pdus, oidCDPCacheTable, ifaces), nil
+}
+
+// parseCDPNeighbors builds TopologyNeighbor records from a walk of
+// cdpCacheEntry. It's split out from pollCDPNeighbors so it can be exercised
+// by unit tests against synthetic PDUs.
+//
+// The OID of each walked varbind is expected to have the form
+// <base>.<col>.<ifIndex>.<cdpCacheDeviceIndex>. Columns of interest:
+//
+//	.3  cdpCacheAddressType (INTEGER, 1=ip)
+//	.4  cdpCacheAddress     (OCTET STRING, raw address bytes)
+//	.5  cdpCacheVersion     (OCTET STRING)
+//	.6  cdpCacheDeviceId    (OCTET STRING, remote device name / chassis id)
+//	.7  cdpCacheDevicePort  (OCTET STRING, remote port name)
+//	.8  cdpCachePlatform    (OCTET STRING, remote platform/model)
+//	.9  cdpCacheCapabilities(OCTET STRING, bit-packed)
+func parseCDPNeighbors(pdus []gosnmp.SnmpPDU, base string, ifaces map[string]*kt.InterfaceData) []kt.TopologyNeighbor {
+	// Keyed by "<ifIndex>.<devIdx>" so we can accrete columns onto a single
+	// record as we iterate the walk.
+	byKey := map[string]*kt.TopologyNeighbor{}
+	order := []string{} // preserve insertion order for deterministic output
+
+	getOrCreate := func(key, ifIdx string) *kt.TopologyNeighbor {
+		if n, ok := byKey[key]; ok {
+			return n
+		}
+		n := &kt.TopologyNeighbor{Source: kt.NeighborSourceCDP}
+		if idx64, err := strconv.ParseInt(ifIdx, 10, 64); err == nil {
+			n.LocalIfIndex = idx64
+		}
+		if ifaces != nil {
+			if id, ok := ifaces[ifIdx]; ok {
+				n.LocalIfName = id.Description
+			}
+		}
+		byKey[key] = n
+		order = append(order, key)
+		return n
+	}
+
+	for _, pdu := range pdus {
+		col, ifIdx, devIdx, ok := splitCDPIndex(pdu.Name, base)
+		if !ok {
+			continue
+		}
+		key := ifIdx + "." + devIdx
+		n := getOrCreate(key, ifIdx)
+
+		switch col {
+		case "4": // cdpCacheAddress
+			if s, ok := decodeCDPAddress(pdu); ok {
+				n.RemoteMgmtAddr = s
+			}
+		case "6": // cdpCacheDeviceId — remote chassis / sysname
+			if s, ok := snmp_util.ReadOctetString(pdu, true); ok {
+				n.RemoteSysName = s
+				// CDP folds chassis id and sysname together; store the
+				// raw value as chassis id too so joins that key on chassis
+				// id still work.
+				n.RemoteChassisID = s
+			}
+		case "7": // cdpCacheDevicePort
+			if s, ok := snmp_util.ReadOctetString(pdu, true); ok {
+				n.RemotePortID = s
+				n.RemotePortDesc = s
+			}
+		case "8": // cdpCachePlatform
+			if s, ok := snmp_util.ReadOctetString(pdu, true); ok {
+				n.RemotePlatform = s
+			}
+		case "9": // cdpCacheCapabilities
+			if s, ok := decodeCapabilityBits(pdu); ok {
+				n.RemoteCapabilities = s
+			}
+		}
+	}
+
+	out := make([]kt.TopologyNeighbor, 0, len(order))
+	for _, k := range order {
+		out = append(out, *byKey[k])
+	}
+	return out
+}
+
+// splitCDPIndex pulls apart an OID walked under cdpCacheEntry. Given a
+// variable.Name like ".1.3.6.1.4.1.9.9.23.1.2.1.1.6.3.1" and
+// base="1.3.6.1.4.1.9.9.23.1.2.1.1", returns col="6", ifIdx="3",
+// devIdx="1". Anything that doesn't look like an entry row returns
+// ok=false and is skipped.
+func splitCDPIndex(name, base string) (col, ifIdx, devIdx string, ok bool) {
+	trimmed := strings.TrimPrefix(name, ".")
+	suffix := strings.TrimPrefix(trimmed, base)
+	suffix = strings.TrimPrefix(suffix, ".")
+	parts := strings.Split(suffix, ".")
+	if len(parts) < 3 {
+		return "", "", "", false
+	}
+	// The index is (ifIndex, cdpCacheDeviceIndex); both are single integers
+	// so we only need the last two elements.
+	col = parts[0]
+	ifIdx = parts[len(parts)-2]
+	devIdx = parts[len(parts)-1]
+	return col, ifIdx, devIdx, true
+}
+
+// decodeCDPAddress parses cdpCacheAddress (raw binary address). IPv4 is the
+// common case (4 bytes); IPv6 is 16. Anything else is reported as hex so it
+// at least survives the round trip.
+func decodeCDPAddress(pdu gosnmp.SnmpPDU) (string, bool) {
+	if pdu.Type != gosnmp.OctetString {
+		return "", false
+	}
+	b, ok := pdu.Value.([]byte)
+	if !ok {
+		return "", false
+	}
+	switch len(b) {
+	case 4:
+		return fmt.Sprintf("%d.%d.%d.%d", b[0], b[1], b[2], b[3]), true
+	case 16:
+		parts := make([]string, 8)
+		for i := 0; i < 8; i++ {
+			parts[i] = fmt.Sprintf("%x", (uint16(b[2*i])<<8)|uint16(b[2*i+1]))
+		}
+		return strings.Join(parts, ":"), true
+	default:
+		if len(b) == 0 {
+			return "", false
+		}
+		return hex.EncodeToString(b), true
+	}
+}
+
+// decodeCapabilityBits renders a bit-packed capability octet-string as a
+// lowercase hex token. Callers that want semantic decoding can split the
+// result back out; for now we just surface the raw bits so nothing is lost.
+func decodeCapabilityBits(pdu gosnmp.SnmpPDU) (string, bool) {
+	if pdu.Type != gosnmp.OctetString {
+		return "", false
+	}
+	b, ok := pdu.Value.([]byte)
+	if !ok || len(b) == 0 {
+		return "", false
+	}
+	return "0x" + hex.EncodeToString(b), true
 }
 
 // mergeNeighbors collapses adjacent records that refer to the same link but
