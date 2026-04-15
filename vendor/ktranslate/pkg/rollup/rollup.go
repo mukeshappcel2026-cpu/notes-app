@@ -1,0 +1,353 @@
+package rollup
+
+import (
+	"flag"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/kentik/ktranslate"
+	"github.com/kentik/ktranslate/pkg/eggs/logger"
+	"github.com/kentik/ktranslate/pkg/filter"
+	"github.com/kentik/ktranslate/pkg/kt"
+)
+
+const (
+	Sum            Method = "sum"
+	Unique                = "unique"
+	Min                   = "min"
+	Max                   = "max"
+	Mean                  = "mean"
+	Median                = "median"
+	Entropy               = "entropy"
+	Percentilerank        = "percentilerank"
+	Percentile            = "entropy"
+
+	KENTIK_EVENT_TYPE = "KFlow:%s:%s"
+	UndefinedKey      = "undefined"
+	DimJoinToken      = "$$"
+)
+
+var (
+	rollups       RollupFlag
+	keyJoin       string
+	topK          int
+	keepUndefined bool
+)
+
+type RollupFlag []string
+
+func (ff *RollupFlag) String() string {
+	return strings.Join(*ff, filter.AndToken)
+}
+func (ff *RollupFlag) Set(val string) error {
+	*ff = append(*ff, strings.TrimSpace(val))
+	return nil
+}
+
+func init() {
+	flag.Var(&rollups, "rollups", "Any rollups to use. Format: type, name, metric, dimension 1, dimension 2, ..., dimension n: sum,bytes,in_bytes,dst_addr")
+	flag.StringVar(&keyJoin, "rollup_key_join", "^", "Token to use to join dimension keys together")
+	flag.IntVar(&topK, "rollup_top_k", 10, "Export only these top values")
+	flag.BoolVar(&keepUndefined, "rollup_keep_undefined", false, "If set, mark undefined values with the string undefined.")
+}
+
+type Roller interface {
+	Add([]map[string]interface{})
+	Export() []Rollup
+	SetFilter(filter.FilterWrapper)
+	GetName() string
+}
+
+type Rollup struct {
+	Dimension string        `json:"dimension"`
+	Metric    float64       `json:"metric"`
+	EventType string        `json:"eventType"`
+	KeyJoin   string        `json:"keyJoin"`
+	Interval  time.Duration `json:"interval"`
+	dims      []string
+	Name      string
+	Count     uint64
+	Min       uint64
+	Max       uint64
+	Provider  kt.Provider
+}
+
+type Method string
+
+type RollupDef struct {
+	Sample     bool
+	Method     Method
+	Metrics    []string
+	Dimensions []string
+	NameSet    []string
+}
+
+/**
+  -filters "string,custom_str.dst_network_bndry,==,external,sum_external"
+
+       -rollups s_sum,sum_external,in_bytes,custom_str.src_subscriber_id
+       -rollups s_sum,sum_external,in_bytes,custom_str.output_provider
+
+  -filters "string,custom_str.src_subscriber_id,!=,'',sum_all_sub_id"
+       -rollups s_sum,sum_all_sub_id,in_bytes,custom_str.output_provider
+*/
+
+func (r *RollupDef) String() string {
+	return fmt.Sprintf("Name(s): %v, Method: %s, Adjust Sample Rate: %v, Metric: %v, Dimensions: %v", r.NameSet, r.Method, r.Sample, r.Metrics, r.Dimensions)
+}
+
+type RollupDefs []RollupDef
+
+func (rf *RollupDefs) String() string {
+	pts := make([]string, len(*rf))
+	for i, r := range *rf {
+		pts[i] = r.String()
+	}
+	return strings.Join(pts, "\n")
+}
+
+func (i *RollupDefs) Set(value string) error {
+	pts := strings.Split(value, ",")
+	if len(pts) < 3 {
+		return fmt.Errorf("Rollup flag is defined by type, name, metric, dimension 1, dimension 2, ..., dimension n")
+	}
+	ptn := make([]string, len(pts))
+	for i, p := range pts {
+		ptn[i] = strings.TrimSpace(p)
+	}
+	if len(ptn[0]) > 2 && ptn[0][0:2] == "s_" {
+		*i = append(*i, RollupDef{
+			Method:     Method(ptn[0][2:]),
+			NameSet:    strings.Split(ptn[1], ";"),
+			Metrics:    strings.Split(ptn[2], "+"),
+			Dimensions: ptn[3:],
+			Sample:     true,
+		})
+	} else {
+		*i = append(*i, RollupDef{
+			Method:     Method(ptn[0]),
+			NameSet:    strings.Split(ptn[1], ";"),
+			Metrics:    strings.Split(ptn[2], "+"),
+			Dimensions: ptn[3:],
+		})
+	}
+	return nil
+}
+
+func GetRollups(log logger.Underlying, cfg *ktranslate.RollupConfig) ([]Roller, error) {
+	rollups := RollupDefs{}
+	for _, r := range cfg.Formats {
+		if err := rollups.Set(r); err != nil {
+			return nil, err
+		}
+	}
+	rolls := make([]Roller, 0)
+	for _, rf := range rollups {
+		switch rf.Method {
+		case Unique:
+			ur, err := newUniqueRollup(log, rf, cfg)
+			if err != nil {
+				return nil, err
+			}
+			rolls = append(rolls, ur)
+		default:
+			statr, err := newStatsRollup(log, rf, cfg)
+			if err != nil {
+				return nil, err
+			}
+			rolls = append(rolls, statr)
+		}
+	}
+
+	// If true, don't drop the rollups which don't get matched.
+	keepUndefined = cfg.KeepUndefined
+
+	return rolls, nil
+}
+
+type byValue []Rollup
+
+func (a byValue) Len() int           { return len(a) }
+func (a byValue) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a byValue) Less(i, j int) bool { return a[j].Metric < a[i].Metric }
+
+type rollupBase struct {
+	metrics      []string
+	multiMetrics [][]string
+	multiDims    [][]string
+	splitDims    map[int]splitDim
+	keyJoin      string
+	topK         int
+	eventType    string
+	mux          sync.RWMutex
+	sample       bool
+	dtime        time.Time
+	nameSet      []string
+	filters      []filter.FilterWrapper
+	hasFilters   bool
+	splitMetrics bool
+}
+
+type splitDim struct {
+	lhs  []string
+	join string
+	rhs  []string
+}
+
+func (r *rollupBase) init(rd RollupDef) error {
+	r.metrics = make([]string, 0)
+	r.multiMetrics = make([][]string, 0)
+	r.multiDims = make([][]string, 0)
+	r.splitDims = map[int]splitDim{}
+	r.dtime = time.Now()
+	r.nameSet = rd.NameSet
+	r.eventType = strings.ReplaceAll(fmt.Sprintf(KENTIK_EVENT_TYPE, strings.Join(rd.Metrics, "_"), strings.Join(rd.Dimensions, ":")), ".", "_")
+	r.sample = rd.Sample
+
+	for i, d := range rd.Dimensions {
+		if strings.Contains(d, DimJoinToken) {
+			joins := strings.SplitN(d, DimJoinToken, 3)
+			if len(joins) == 3 {
+				lhs := strings.Split(joins[0], ".")
+				join := joins[1]
+				rhs := strings.Split(joins[2], ".")
+				r.splitDims[i] = splitDim{lhs: lhs, join: join, rhs: rhs}
+				r.multiDims = append(r.multiDims, []string{d})
+			} else {
+				return fmt.Errorf("Invalid dimension grouping: %s", d)
+			}
+		} else {
+			pts := strings.Split(d, ".")
+			r.multiDims = append(r.multiDims, pts)
+			switch len(pts) {
+			case 1: // noop
+			case 2: // noop
+			default:
+				return fmt.Errorf("Invalid dimension: %s", d)
+			}
+		}
+	}
+
+	for _, m := range rd.Metrics {
+		pts := strings.Split(m, ".")
+		switch len(pts) {
+		case 1:
+			splitSet := strings.Split(m, ";")
+			if len(splitSet) > 1 {
+				r.splitMetrics = true
+				r.metrics = append(r.metrics, splitSet...)
+			} else {
+				r.metrics = append(r.metrics, m)
+			}
+		case 2:
+			r.multiMetrics = append(r.multiMetrics, pts)
+		default:
+			return fmt.Errorf("Invalid metric: %s", m)
+		}
+	}
+
+	return nil
+}
+
+func (r *rollupBase) getKey(mapr map[string]interface{}) string {
+	keyPts := make([]string, len(r.multiDims))
+
+	setKey := func(d []string) string {
+		key := ""
+		if len(d) == 1 {
+			if dd, ok := mapr[d[0]]; ok {
+				switch v := dd.(type) {
+				case string:
+					key = v
+				case int64:
+					key = strconv.Itoa(int(v))
+				default:
+					// Skip?
+				}
+			}
+		} else {
+			if d1, ok := mapr[d[0]]; ok {
+				switch dd := d1.(type) {
+				case map[string]string:
+					key = dd[d[1]]
+					if key == "" {
+						if strings.HasPrefix(d[1], "source_") {
+							key = dd["dest_"+d[1][7:]]
+						} else if strings.HasPrefix(d[1], "dest_") {
+							key = dd["source_"+d[1][5:]]
+						}
+					}
+				case map[string]int32:
+					key = strconv.Itoa(int(dd[d[1]]))
+				case map[string]int64:
+					key = strconv.Itoa(int(dd[d[1]]))
+				}
+			}
+		}
+		if keepUndefined && key == "" {
+			key = UndefinedKey
+		}
+		return key
+	}
+
+	for i, d := range r.multiDims {
+		if md, ok := r.splitDims[i]; !ok {
+			keyPts[i] = setKey(d) // There's no join so just go here.
+		} else {
+			// We're doing a join so have to get a few keys at once.
+			lhs := setKey(md.lhs)
+			rhs := setKey(md.rhs)
+			keyPts[i] = lhs + md.join + rhs
+		}
+	}
+
+	return strings.Join(keyPts, r.keyJoin)
+}
+
+func (r *Rollup) GetDims() []string {
+	return r.dims
+}
+
+func combo(multiDims [][]string) []string {
+	ret := make([]string, len(multiDims))
+	for i, d := range multiDims {
+		if len(d) == 1 {
+			ret[i] = d[0]
+		} else {
+			ret[i] = d[1]
+		}
+	}
+	return ret
+}
+
+func (r *rollupBase) filter(in []map[string]interface{}) []map[string]interface{} {
+	res := make([]map[string]interface{}, 0, len(in))
+	for _, flow := range in {
+		keep := true
+		for _, f := range r.filters {
+			if !f.FilterMap(flow) {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			res = append(res, flow)
+		}
+	}
+	return res
+}
+
+func (r *rollupBase) SetFilter(fw filter.FilterWrapper) {
+	if r.filters == nil {
+		r.filters = []filter.FilterWrapper{}
+		r.hasFilters = true
+	}
+	r.filters = append(r.filters, fw)
+}
+
+func (r *rollupBase) GetName() string {
+	return strings.Join(r.nameSet, ";")
+}

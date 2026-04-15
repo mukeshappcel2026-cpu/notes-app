@@ -1,0 +1,1714 @@
+From 92398b696d58d724c5d0c0188568d15d69902db4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 11 Apr 2026 17:18:29 +0000
+Subject: [PATCH 8/9] ktranslate-topology: live web viewer for SNMP topology
+ data
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a standalone viewer binary at cmd/ktranslate-topology that turns
+KSnmpTopology JCHF records emitted by the main ktranslate binary into
+an auto-refreshing web page showing devices, their interfaces, and the
+links between them.
+
+Architecture:
+
+- graph.go — in-memory store with Device -> Interface -> Link nodes.
+  Links are canonicalised by sorting the (device,interface) endpoints so
+  reciprocal views (A->B plus B->A) collapse into a single edge tagged
+  with the union of their discovery sources. A Snapshot() method
+  prunes stale links (older than the configurable -ttl flag) and emits
+  a nodes+edges document for the browser.
+
+- ingest.go — parses a kt.JCHF-shaped JSON payload (the exact shape
+  ktranslate's -format=json sink produces), filters to topology
+  records, handles gzip bodies, and applies each observation to the
+  graph. Declared its own local struct instead of importing pkg/kt so
+  the viewer stays free of the gosnmp / leveldb dependency chain.
+
+- server.go — net/http handler with POST /ingest, GET /graph.json,
+  GET /healthz, and GET / for the static HTML viewer. The HTML file is
+  embedded via //go:embed so the binary has no runtime file dependency.
+
+- assets/index.html — single-file, self-contained viewer built on
+  vanilla JS + SVG. Implements a small force-directed layout (node
+  repulsion, edge springs, interface-to-device "glue" springs, centre
+  pull) so no JS framework or CDN asset is required — the page works
+  fully offline. Devices are drawn as blue nodes with their interfaces
+  clustered around them; link colour reflects the discovery protocol
+  (LLDP green, CDP yellow, both blue).
+
+- main.go — flag parsing (-listen, -ttl), graceful shutdown on
+  SIGINT/SIGTERM, thin plumbing.
+
+Tests cover link dedup / source merge, TTL pruning and orphaning,
+missing-field dropping, JSON ingest (array and single-object bodies),
+gzip, neighbor_source "lldp+cdp" parsing, and every HTTP endpoint.
+
+Wiring it up is a one-line change to ktranslate's sinks:
+
+  ktranslate -format json -sinks http \
+    -http_url http://localhost:8082/ingest ...
+  ktranslate-topology -listen :8082
+
+See the Live topology viewer section in vendor/ktranslate/README.md
+for details.
+---
+ README.md                                 |  47 +++
+ cmd/ktranslate-topology/assets/index.html | 364 ++++++++++++++++++++++
+ cmd/ktranslate-topology/graph.go          | 340 ++++++++++++++++++++
+ cmd/ktranslate-topology/graph_test.go     | 205 ++++++++++++
+ cmd/ktranslate-topology/ingest.go         | 162 ++++++++++
+ cmd/ktranslate-topology/ingest_test.go    | 177 +++++++++++
+ cmd/ktranslate-topology/main.go           |  74 +++++
+ cmd/ktranslate-topology/server.go         |  98 ++++++
+ cmd/ktranslate-topology/server_test.go    | 109 +++++++
+ 9 files changed, 1576 insertions(+)
+ create mode 100644 vendor/ktranslate/cmd/ktranslate-topology/assets/index.html
+ create mode 100644 vendor/ktranslate/cmd/ktranslate-topology/graph.go
+ create mode 100644 vendor/ktranslate/cmd/ktranslate-topology/graph_test.go
+ create mode 100644 vendor/ktranslate/cmd/ktranslate-topology/ingest.go
+ create mode 100644 vendor/ktranslate/cmd/ktranslate-topology/ingest_test.go
+ create mode 100644 vendor/ktranslate/cmd/ktranslate-topology/main.go
+ create mode 100644 vendor/ktranslate/cmd/ktranslate-topology/server.go
+ create mode 100644 vendor/ktranslate/cmd/ktranslate-topology/server_test.go
+
+diff --git a/README.md b/README.md
+index 071aad7..e020a35 100644
+--- a/README.md
++++ b/README.md
+@@ -277,6 +277,53 @@ When both LLDP and CDP report the same neighbor on the same local port,
+ the two records are merged into a single one with
+ `neighbor_source = lldp+cdp`.
+ 
++## Live topology viewer
++
++A standalone viewer lives alongside the main binary at
++`cmd/ktranslate-topology`. It ingests `KSnmpTopology` records from the
++main ktranslate process over HTTP, stitches them into a graph (with
++reciprocal views collapsed and stale links pruned), and serves an
++auto-refreshing web page that draws devices, their interfaces, and the
++links between them.
++
++Build and run the viewer:
++
++```bash
++go build -o ktranslate-topology ./cmd/ktranslate-topology
++./ktranslate-topology -listen :8082 -ttl 2h
++```
++
++Point the main ktranslate process at it using the existing `http` sink:
++
++```bash
++ktranslate \
++  -format json \
++  -sinks http \
++  -http_url http://localhost:8082/ingest \
++  -snmp /etc/ktranslate/snmp.yaml
++```
++
++Open `http://localhost:8082/` in a browser. The page polls
++`/graph.json` every N seconds (adjustable in the toolbar). Devices are
++drawn as blue nodes with their interfaces clustered around them; links
++between interfaces are coloured by the discovery protocol (LLDP green,
++CDP yellow, both blue).
++
++Flags:
++
++- `-listen` — address to listen on (default `:8082`).
++- `-ttl` — drop links not seen within this window (default `2h`). Set
++  to `0` to disable pruning.
++
++Endpoints:
++
++- `POST /ingest` — ktranslate's HTTP sink target. Accepts JSON array
++  payloads and single objects, plus gzip. Non-topology records are
++  silently ignored so pointing a general JSON stream at it works.
++- `GET /graph.json` — current nodes+edges snapshot.
++- `GET /` — the HTML viewer (fully self-contained, no CDNs).
++- `GET /healthz` — liveness probe.
++
+ # pprof
+ To expose profiling endpoints, use the `-metalisten` flag. This can be used with tools such as
+ `go tool pprof` to capture and view the data. For example, if `ktranslate` was started with
+diff --git a/cmd/ktranslate-topology/assets/index.html b/cmd/ktranslate-topology/assets/index.html
+new file mode 100644
+index 0000000..c1a1064
+--- /dev/null
++++ b/cmd/ktranslate-topology/assets/index.html
+@@ -0,0 +1,364 @@
++<!doctype html>
++<html lang="en">
++<head>
++  <meta charset="utf-8">
++  <title>ktranslate topology</title>
++  <style>
++    html, body { margin: 0; padding: 0; height: 100%; font-family: ui-sans-serif, system-ui, sans-serif; background: #0b0f14; color: #e6edf3; }
++    #toolbar {
++      position: absolute; top: 0; left: 0; right: 0; height: 36px;
++      display: flex; align-items: center; gap: 16px; padding: 0 16px;
++      background: #111820; border-bottom: 1px solid #1f2a38; z-index: 5;
++      font-size: 13px;
++    }
++    #toolbar .stat { color: #9fb3c8; }
++    #toolbar .stat b { color: #e6edf3; }
++    #toolbar label { color: #9fb3c8; }
++    #toolbar input[type=range] { vertical-align: middle; }
++    #graph { position: absolute; top: 36px; left: 0; right: 0; bottom: 0; }
++    svg { width: 100%; height: 100%; display: block; }
++    .device circle { fill: #1f6feb; stroke: #58a6ff; stroke-width: 2px; }
++    .device text { fill: #e6edf3; font-size: 13px; font-weight: 600; pointer-events: none; }
++    .interface circle { fill: #2d333b; stroke: #6e7681; stroke-width: 1px; }
++    .interface text { fill: #9fb3c8; font-size: 10px; pointer-events: none; }
++    .link { stroke: #8b949e; stroke-width: 1.5px; }
++    .link.lldp { stroke: #3fb950; }
++    .link.cdp { stroke: #d29922; }
++    .link.both { stroke: #58a6ff; stroke-width: 2.5px; }
++    .hover text { font-weight: 700; fill: #fff; }
++    #tooltip {
++      position: absolute; pointer-events: none; background: #161b22;
++      border: 1px solid #30363d; padding: 6px 10px; font-size: 12px;
++      border-radius: 4px; color: #e6edf3; max-width: 260px; display: none;
++    }
++  </style>
++</head>
++<body>
++  <div id="toolbar">
++    <div class="stat">devices: <b id="st-devices">0</b></div>
++    <div class="stat">links: <b id="st-links">0</b></div>
++    <div class="stat">updated: <b id="st-updated">—</b></div>
++    <label>refresh
++      <input id="refresh" type="range" min="2" max="60" value="10" step="1">
++      <b id="refreshLabel">10s</b>
++    </label>
++    <div class="stat" style="margin-left:auto">
++      legend:
++      <span style="color:#3fb950">lldp</span>
++      <span style="color:#d29922">cdp</span>
++      <span style="color:#58a6ff">both</span>
++    </div>
++  </div>
++  <div id="graph">
++    <svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg>
++  </div>
++  <div id="tooltip"></div>
++
++<script>
++/*
++ * Topology renderer — vanilla JS + SVG force-directed layout.
++ *
++ * Data source: GET /graph.json returns { nodes: [...], edges: [...] }
++ * produced by the Go backend's Snapshot method. We poll it on an
++ * interval, diff it into the simulation state, and run a small physics
++ * loop to place nodes.
++ */
++
++const svg = document.getElementById('svg');
++const tooltip = document.getElementById('tooltip');
++const stDevices = document.getElementById('st-devices');
++const stLinks = document.getElementById('st-links');
++const stUpdated = document.getElementById('st-updated');
++const refreshInput = document.getElementById('refresh');
++const refreshLabel = document.getElementById('refreshLabel');
++
++let W = svg.clientWidth || window.innerWidth;
++let H = svg.clientHeight || window.innerHeight;
++function onResize() {
++  W = svg.clientWidth || window.innerWidth;
++  H = svg.clientHeight || window.innerHeight;
++}
++window.addEventListener('resize', onResize);
++
++// Simulation state.
++let nodes = new Map();   // id -> { id, x, y, vx, vy, meta }
++let edges = [];          // [{ id, source, target, sources, meta }]
++let dragging = null;
++
++// SVG layers (edges behind nodes).
++const edgesLayer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
++const nodesLayer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
++svg.appendChild(edgesLayer);
++svg.appendChild(nodesLayer);
++
++async function fetchGraph() {
++  try {
++    const resp = await fetch('/graph.json', { cache: 'no-store' });
++    if (!resp.ok) throw new Error('HTTP ' + resp.status);
++    const data = await resp.json();
++    ingest(data);
++    stDevices.textContent = data.counts ? data.counts.devices : 0;
++    stLinks.textContent = data.counts ? data.counts.links : 0;
++    stUpdated.textContent = new Date(data.generated_at).toLocaleTimeString();
++  } catch (e) {
++    stUpdated.textContent = 'error: ' + e.message;
++  }
++}
++
++function ingest(data) {
++  const incomingIds = new Set();
++  // Preserve positions for existing nodes; seed new ones near the centre
++  // with a small random offset so force layout can separate them.
++  for (const n of data.nodes) {
++    incomingIds.add(n.id);
++    const existing = nodes.get(n.id);
++    if (existing) {
++      existing.meta = n;
++    } else {
++      nodes.set(n.id, {
++        id: n.id,
++        x: W / 2 + (Math.random() - 0.5) * 100,
++        y: H / 2 + (Math.random() - 0.5) * 100,
++        vx: 0,
++        vy: 0,
++        meta: n,
++      });
++    }
++  }
++  for (const id of [...nodes.keys()]) {
++    if (!incomingIds.has(id)) nodes.delete(id);
++  }
++
++  edges = data.edges.map(e => ({
++    id: e.id,
++    source: e.source,
++    target: e.target,
++    sources: e.sources || [],
++    meta: e,
++  })).filter(e => nodes.has(e.source) && nodes.has(e.target));
++
++  rebuildDOM();
++}
++
++function rebuildDOM() {
++  edgesLayer.innerHTML = '';
++  nodesLayer.innerHTML = '';
++
++  for (const e of edges) {
++    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
++    line.setAttribute('class', 'link ' + linkClass(e.sources));
++    line.dataset.id = e.id;
++    line.addEventListener('mouseenter', ev => showTooltip(ev, edgeTooltip(e)));
++    line.addEventListener('mousemove', moveTooltip);
++    line.addEventListener('mouseleave', hideTooltip);
++    edgesLayer.appendChild(line);
++    e._el = line;
++  }
++
++  for (const node of nodes.values()) {
++    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
++    g.setAttribute('class', node.meta.kind);
++    const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
++    c.setAttribute('r', node.meta.kind === 'device' ? 16 : 6);
++    const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
++    t.textContent = node.meta.label;
++    t.setAttribute('text-anchor', 'middle');
++    t.setAttribute('dy', node.meta.kind === 'device' ? -22 : -10);
++    g.appendChild(c);
++    g.appendChild(t);
++    g.addEventListener('mouseenter', ev => showTooltip(ev, nodeTooltip(node.meta)));
++    g.addEventListener('mousemove', moveTooltip);
++    g.addEventListener('mouseleave', hideTooltip);
++    g.addEventListener('mousedown', ev => {
++      dragging = node;
++      ev.preventDefault();
++    });
++    nodesLayer.appendChild(g);
++    node._el = g;
++  }
++}
++
++function linkClass(srcs) {
++  if (!srcs || srcs.length === 0) return '';
++  if (srcs.length > 1) return 'both';
++  return srcs[0];
++}
++
++function nodeTooltip(m) {
++  const lines = ['<b>' + escape(m.label) + '</b>'];
++  if (m.kind === 'device') {
++    lines.push('type: device');
++    if (m.ip) lines.push('ip: ' + escape(m.ip));
++    if (m.sys_descr) lines.push('sysDescr: ' + escape(m.sys_descr));
++  } else {
++    lines.push('type: interface');
++    if (m.if_index) lines.push('ifIndex: ' + m.if_index);
++  }
++  return lines.join('<br>');
++}
++
++function edgeTooltip(e) {
++  return '<b>link</b><br>sources: ' + e.sources.join(', ');
++}
++
++function showTooltip(ev, html) {
++  tooltip.innerHTML = html;
++  tooltip.style.display = 'block';
++  moveTooltip(ev);
++}
++function moveTooltip(ev) {
++  tooltip.style.left = (ev.clientX + 12) + 'px';
++  tooltip.style.top = (ev.clientY + 12) + 'px';
++}
++function hideTooltip() { tooltip.style.display = 'none'; }
++
++function escape(s) {
++  return String(s).replace(/[&<>"']/g, c => ({
++    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
++  }[c]));
++}
++
++window.addEventListener('mousemove', ev => {
++  if (dragging) {
++    const rect = svg.getBoundingClientRect();
++    dragging.x = ev.clientX - rect.left;
++    dragging.y = ev.clientY - rect.top;
++    dragging.vx = 0;
++    dragging.vy = 0;
++  }
++});
++window.addEventListener('mouseup', () => { dragging = null; });
++
++/*
++ * Physics loop.
++ * - Repulsion between every pair of nodes (Coulomb-like).
++ * - Spring attraction along every edge, with a stronger "glue" spring
++ *   from each interface to its parent device so ports stay clustered.
++ * - Centering force so the graph drifts toward the middle.
++ * - Velocity damping each tick.
++ */
++const REPULSION = 6000;
++const LINK_DIST = 120;
++const LINK_K = 0.02;
++const PARENT_DIST = 28;
++const PARENT_K = 0.08;
++const CENTER_K = 0.002;
++const DAMPING = 0.85;
++
++function tick() {
++  const nodeList = [...nodes.values()];
++
++  // Repulsion: O(n^2) but n is small for network topology use.
++  for (let i = 0; i < nodeList.length; i++) {
++    const a = nodeList[i];
++    for (let j = i + 1; j < nodeList.length; j++) {
++      const b = nodeList[j];
++      let dx = a.x - b.x;
++      let dy = a.y - b.y;
++      let dsq = dx * dx + dy * dy;
++      if (dsq < 1) dsq = 1;
++      const f = REPULSION / dsq;
++      const d = Math.sqrt(dsq);
++      const ux = dx / d, uy = dy / d;
++      a.vx += ux * f * 0.01;
++      a.vy += uy * f * 0.01;
++      b.vx -= ux * f * 0.01;
++      b.vy -= uy * f * 0.01;
++    }
++  }
++
++  // Edge springs.
++  for (const e of edges) {
++    const s = nodes.get(e.source);
++    const t = nodes.get(e.target);
++    if (!s || !t) continue;
++    const dx = t.x - s.x;
++    const dy = t.y - s.y;
++    const d = Math.sqrt(dx * dx + dy * dy) || 1;
++    const f = (d - LINK_DIST) * LINK_K;
++    const ux = dx / d, uy = dy / d;
++    s.vx += ux * f;
++    s.vy += uy * f;
++    t.vx -= ux * f;
++    t.vy -= uy * f;
++  }
++
++  // Parent-child "glue": interfaces attached to their device.
++  for (const node of nodeList) {
++    if (node.meta.kind !== 'interface' || !node.meta.parent) continue;
++    const p = nodes.get(node.meta.parent);
++    if (!p) continue;
++    const dx = p.x - node.x;
++    const dy = p.y - node.y;
++    const d = Math.sqrt(dx * dx + dy * dy) || 1;
++    const f = (d - PARENT_DIST) * PARENT_K;
++    const ux = dx / d, uy = dy / d;
++    node.vx += ux * f;
++    node.vy += uy * f;
++    p.vx -= ux * f * 0.3; // device is heavier
++    p.vy -= uy * f * 0.3;
++  }
++
++  // Centering.
++  for (const node of nodeList) {
++    node.vx += (W / 2 - node.x) * CENTER_K;
++    node.vy += (H / 2 - node.y) * CENTER_K;
++  }
++
++  // Integrate + damp.
++  for (const node of nodeList) {
++    if (node === dragging) continue;
++    node.vx *= DAMPING;
++    node.vy *= DAMPING;
++    node.x += node.vx;
++    node.y += node.vy;
++    // Keep everything on-screen.
++    const pad = 40;
++    if (node.x < pad) node.x = pad;
++    if (node.y < pad + 36) node.y = pad + 36;
++    if (node.x > W - pad) node.x = W - pad;
++    if (node.y > H - pad) node.y = H - pad;
++  }
++
++  render();
++  requestAnimationFrame(tick);
++}
++
++function render() {
++  for (const node of nodes.values()) {
++    if (!node._el) continue;
++    node._el.setAttribute('transform', 'translate(' + node.x + ',' + node.y + ')');
++  }
++  for (const e of edges) {
++    if (!e._el) continue;
++    const s = nodes.get(e.source);
++    const t = nodes.get(e.target);
++    if (!s || !t) continue;
++    e._el.setAttribute('x1', s.x);
++    e._el.setAttribute('y1', s.y);
++    e._el.setAttribute('x2', t.x);
++    e._el.setAttribute('y2', t.y);
++  }
++}
++
++// Kick off the loop, initial fetch, and refresh timer.
++let refreshMs = 10000;
++refreshInput.addEventListener('input', () => {
++  refreshMs = parseInt(refreshInput.value, 10) * 1000;
++  refreshLabel.textContent = refreshInput.value + 's';
++  resetRefresh();
++});
++
++let refreshTimer = null;
++function resetRefresh() {
++  if (refreshTimer) clearInterval(refreshTimer);
++  refreshTimer = setInterval(fetchGraph, refreshMs);
++}
++
++fetchGraph().then(() => {
++  requestAnimationFrame(tick);
++  resetRefresh();
++});
++</script>
++</body>
++</html>
+diff --git a/cmd/ktranslate-topology/graph.go b/cmd/ktranslate-topology/graph.go
+new file mode 100644
+index 0000000..9a49d23
+--- /dev/null
++++ b/cmd/ktranslate-topology/graph.go
+@@ -0,0 +1,340 @@
++package main
++
++import (
++	"sort"
++	"sync"
++	"time"
++)
++
++// Graph is an in-memory, thread-safe model of the network topology built up
++// from KSnmpTopology records. Devices hold a map of their interfaces; Links
++// are canonicalised so that reciprocal views (A sees B, B sees A) collapse
++// into a single edge.
++type Graph struct {
++	mu      sync.RWMutex
++	devices map[string]*Device // key: device name
++	links   map[string]*Link   // key: canonical link id
++	ttl     time.Duration
++	now     func() time.Time // injectable for tests
++}
++
++// Device is a node in the graph. Interfaces are modelled as child nodes so
++// that edges can connect specific ports rather than whole devices.
++type Device struct {
++	Name       string                `json:"name"`
++	IP         string                `json:"ip,omitempty"`
++	SysDescr   string                `json:"sys_descr,omitempty"`
++	Interfaces map[string]*Interface `json:"-"` // serialised separately
++	LastSeen   time.Time             `json:"last_seen"`
++}
++
++// Interface is a named port on a Device.
++type Interface struct {
++	Name     string    `json:"name"`
++	IfIndex  int64     `json:"if_index,omitempty"`
++	LastSeen time.Time `json:"last_seen"`
++}
++
++// Link is an edge between two interface endpoints, annotated with the
++// protocol(s) that discovered it.
++type Link struct {
++	ID       string    `json:"id"`
++	A        Endpoint  `json:"a"`
++	B        Endpoint  `json:"b"`
++	Sources  []string  `json:"sources"` // sorted, unique
++	LastSeen time.Time `json:"last_seen"`
++}
++
++// Endpoint identifies one end of a link.
++type Endpoint struct {
++	Device    string `json:"device"`
++	Interface string `json:"interface"`
++}
++
++// NewGraph returns an empty graph with the given link TTL. Links not seen
++// within ttl are pruned lazily on Snapshot calls.
++func NewGraph(ttl time.Duration) *Graph {
++	return &Graph{
++		devices: make(map[string]*Device),
++		links:   make(map[string]*Link),
++		ttl:     ttl,
++		now:     time.Now,
++	}
++}
++
++// Observation carries the denormalised fields extracted from a single
++// KSnmpTopology record. The graph package deliberately doesn't depend on
++// pkg/kt; ingest.go is the only thing that knows how to pull these fields
++// out of a JCHF JSON payload.
++type Observation struct {
++	LocalDevice     string
++	LocalDeviceIP   string
++	LocalSysDescr   string
++	LocalIfName     string
++	LocalIfIndex    int64
++	RemoteDevice    string
++	RemoteIfName    string
++	RemoteMgmtAddr  string
++	NeighborSources []string // e.g. ["lldp"] or ["lldp","cdp"]
++	Timestamp       time.Time
++}
++
++// Apply merges a single observation into the graph. Observations are
++// idempotent: seeing the same link twice just refreshes LastSeen.
++func (g *Graph) Apply(obs Observation) {
++	if obs.LocalDevice == "" || obs.LocalIfName == "" {
++		return
++	}
++	if obs.RemoteDevice == "" {
++		// A remote without any identifier isn't worth a node on its own;
++		// drop the observation rather than building an anonymous island.
++		return
++	}
++	ts := obs.Timestamp
++	if ts.IsZero() {
++		ts = g.now()
++	}
++
++	g.mu.Lock()
++	defer g.mu.Unlock()
++
++	g.touchDevice(obs.LocalDevice, obs.LocalDeviceIP, obs.LocalSysDescr, ts)
++	g.touchInterface(obs.LocalDevice, obs.LocalIfName, obs.LocalIfIndex, ts)
++
++	// The remote side is seen through a neighbor record, so we know its
++	// name but not its IP (unless the advertised management address is
++	// set, which we use).
++	g.touchDevice(obs.RemoteDevice, obs.RemoteMgmtAddr, "", ts)
++	if obs.RemoteIfName != "" {
++		g.touchInterface(obs.RemoteDevice, obs.RemoteIfName, 0, ts)
++	}
++
++	a := Endpoint{Device: obs.LocalDevice, Interface: obs.LocalIfName}
++	b := Endpoint{Device: obs.RemoteDevice, Interface: obs.RemoteIfName}
++	id, a, b := canonicalLinkID(a, b)
++
++	link, ok := g.links[id]
++	if !ok {
++		link = &Link{ID: id, A: a, B: b}
++		g.links[id] = link
++	}
++	link.LastSeen = ts
++	link.Sources = mergeSources(link.Sources, obs.NeighborSources)
++}
++
++// touchDevice inserts or refreshes a device node. Call with g.mu held.
++func (g *Graph) touchDevice(name, ip, sysDescr string, ts time.Time) {
++	d, ok := g.devices[name]
++	if !ok {
++		d = &Device{
++			Name:       name,
++			Interfaces: make(map[string]*Interface),
++		}
++		g.devices[name] = d
++	}
++	if ip != "" {
++		d.IP = ip
++	}
++	if sysDescr != "" {
++		d.SysDescr = sysDescr
++	}
++	d.LastSeen = ts
++}
++
++// touchInterface inserts or refreshes an interface node on a device. Call
++// with g.mu held. The device must already exist (touchDevice guarantees
++// this when both are called in order).
++func (g *Graph) touchInterface(device, ifName string, ifIndex int64, ts time.Time) {
++	d, ok := g.devices[device]
++	if !ok {
++		return
++	}
++	i, ok := d.Interfaces[ifName]
++	if !ok {
++		i = &Interface{Name: ifName}
++		d.Interfaces[ifName] = i
++	}
++	if ifIndex != 0 {
++		i.IfIndex = ifIndex
++	}
++	i.LastSeen = ts
++}
++
++// canonicalLinkID returns a stable identifier for a link regardless of
++// which side was reporting. The endpoints are returned in the order they
++// appear in the canonical id, so callers can store them in the same order.
++func canonicalLinkID(a, b Endpoint) (string, Endpoint, Endpoint) {
++	ka := a.Device + "|" + a.Interface
++	kb := b.Device + "|" + b.Interface
++	if ka <= kb {
++		return ka + "<->" + kb, a, b
++	}
++	return kb + "<->" + ka, b, a
++}
++
++// mergeSources returns the union of two source slices as a sorted,
++// deduped slice. Nil inputs are treated as empty.
++func mergeSources(cur, add []string) []string {
++	set := make(map[string]struct{}, len(cur)+len(add))
++	for _, s := range cur {
++		if s != "" {
++			set[s] = struct{}{}
++		}
++	}
++	for _, s := range add {
++		if s != "" {
++			set[s] = struct{}{}
++		}
++	}
++	out := make([]string, 0, len(set))
++	for s := range set {
++		out = append(out, s)
++	}
++	sort.Strings(out)
++	return out
++}
++
++// Snapshot is the wire format handed to the browser. It's a plain
++// nodes+edges document that the embedded renderer understands.
++type Snapshot struct {
++	GeneratedAt time.Time       `json:"generated_at"`
++	Nodes       []SnapshotNode  `json:"nodes"`
++	Edges       []SnapshotEdge  `json:"edges"`
++	Counts      map[string]int  `json:"counts"`
++}
++
++// SnapshotNode is either a device or an interface. Interface nodes have
++// Parent set to the owning device id so the renderer can group them.
++type SnapshotNode struct {
++	ID       string `json:"id"`
++	Label    string `json:"label"`
++	Kind     string `json:"kind"` // "device" or "interface"
++	Parent   string `json:"parent,omitempty"`
++	SysDescr string `json:"sys_descr,omitempty"`
++	IP       string `json:"ip,omitempty"`
++	IfIndex  int64  `json:"if_index,omitempty"`
++}
++
++// SnapshotEdge connects two node ids (always interface ids).
++type SnapshotEdge struct {
++	ID      string   `json:"id"`
++	Source  string   `json:"source"` // node id of the A-side interface
++	Target  string   `json:"target"` // node id of the B-side interface
++	Sources []string `json:"sources"`
++}
++
++// Snapshot produces a read-only view of the current graph suitable for
++// JSON serialisation. Stale links (older than g.ttl) are dropped along
++// with interfaces and devices that become orphaned as a result.
++func (g *Graph) Snapshot() Snapshot {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++
++	now := g.now()
++	g.pruneLocked(now)
++
++	// Build the node set from whatever devices/interfaces are still
++	// referenced either by a fresh link or by a fresh device record. We
++	// include devices without any links too so freshly-polled-but-
++	// unconnected devices still show up.
++	nodes := make([]SnapshotNode, 0, len(g.devices)*2)
++	deviceIDs := map[string]string{}
++	ifaceIDs := map[string]string{}
++
++	// Stable ordering keeps the renderer happy across refreshes.
++	deviceNames := make([]string, 0, len(g.devices))
++	for name := range g.devices {
++		deviceNames = append(deviceNames, name)
++	}
++	sort.Strings(deviceNames)
++
++	for _, name := range deviceNames {
++		d := g.devices[name]
++		did := "dev:" + name
++		deviceIDs[name] = did
++		nodes = append(nodes, SnapshotNode{
++			ID:       did,
++			Label:    name,
++			Kind:     "device",
++			IP:       d.IP,
++			SysDescr: d.SysDescr,
++		})
++		ifaceNames := make([]string, 0, len(d.Interfaces))
++		for n := range d.Interfaces {
++			ifaceNames = append(ifaceNames, n)
++		}
++		sort.Strings(ifaceNames)
++		for _, ifn := range ifaceNames {
++			iface := d.Interfaces[ifn]
++			iid := "if:" + name + "|" + ifn
++			ifaceIDs[name+"|"+ifn] = iid
++			nodes = append(nodes, SnapshotNode{
++				ID:      iid,
++				Label:   ifn,
++				Kind:    "interface",
++				Parent:  did,
++				IfIndex: iface.IfIndex,
++			})
++		}
++	}
++
++	// Edges over the freshly-pruned link set.
++	linkIDs := make([]string, 0, len(g.links))
++	for id := range g.links {
++		linkIDs = append(linkIDs, id)
++	}
++	sort.Strings(linkIDs)
++
++	edges := make([]SnapshotEdge, 0, len(linkIDs))
++	for _, id := range linkIDs {
++		link := g.links[id]
++		src, ok1 := ifaceIDs[link.A.Device+"|"+link.A.Interface]
++		dst, ok2 := ifaceIDs[link.B.Device+"|"+link.B.Interface]
++		if !ok1 || !ok2 {
++			// An endpoint's interface was pruned. Skip; it'll come back
++			// on the next fresh poll.
++			continue
++		}
++		edges = append(edges, SnapshotEdge{
++			ID:      id,
++			Source:  src,
++			Target:  dst,
++			Sources: append([]string(nil), link.Sources...),
++		})
++	}
++
++	return Snapshot{
++		GeneratedAt: now,
++		Nodes:       nodes,
++		Edges:       edges,
++		Counts: map[string]int{
++			"devices": len(deviceNames),
++			"links":   len(edges),
++		},
++	}
++}
++
++// pruneLocked drops stale links and empties out any interfaces/devices
++// that no longer have fresh observations. Caller must hold g.mu.
++func (g *Graph) pruneLocked(now time.Time) {
++	if g.ttl <= 0 {
++		return
++	}
++	cutoff := now.Add(-g.ttl)
++
++	for id, link := range g.links {
++		if link.LastSeen.Before(cutoff) {
++			delete(g.links, id)
++		}
++	}
++	for name, d := range g.devices {
++		for ifName, iface := range d.Interfaces {
++			if iface.LastSeen.Before(cutoff) {
++				delete(d.Interfaces, ifName)
++			}
++		}
++		if d.LastSeen.Before(cutoff) && len(d.Interfaces) == 0 {
++			delete(g.devices, name)
++		}
++	}
++}
+diff --git a/cmd/ktranslate-topology/graph_test.go b/cmd/ktranslate-topology/graph_test.go
+new file mode 100644
+index 0000000..f8fae35
+--- /dev/null
++++ b/cmd/ktranslate-topology/graph_test.go
+@@ -0,0 +1,205 @@
++package main
++
++import (
++	"testing"
++	"time"
++)
++
++func fixedTime(t time.Time) func() time.Time {
++	return func() time.Time { return t }
++}
++
++func TestCanonicalLinkID_SortsEndpoints(t *testing.T) {
++	a := Endpoint{Device: "z-switch", Interface: "Eth1/1"}
++	b := Endpoint{Device: "a-switch", Interface: "Eth2/2"}
++
++	id1, first1, second1 := canonicalLinkID(a, b)
++	id2, first2, second2 := canonicalLinkID(b, a)
++
++	if id1 != id2 {
++		t.Errorf("canonical id must be order-independent; got %q vs %q", id1, id2)
++	}
++	if first1 != first2 || second1 != second2 {
++		t.Errorf("endpoint order must be canonical; got (%v,%v) vs (%v,%v)",
++			first1, second1, first2, second2)
++	}
++	if first1.Device != "a-switch" {
++		t.Errorf("a-switch should come first alphabetically, got %q", first1.Device)
++	}
++}
++
++func TestMergeSources_UnionAndSort(t *testing.T) {
++	out := mergeSources([]string{"lldp"}, []string{"cdp"})
++	if len(out) != 2 || out[0] != "cdp" || out[1] != "lldp" {
++		t.Errorf("expected [cdp,lldp], got %v", out)
++	}
++	// Duplicate-safe.
++	out = mergeSources([]string{"lldp", "cdp"}, []string{"lldp"})
++	if len(out) != 2 {
++		t.Errorf("dedup failed: %v", out)
++	}
++	// Empty input = empty output.
++	if out := mergeSources(nil, nil); len(out) != 0 {
++		t.Errorf("expected empty, got %v", out)
++	}
++}
++
++func TestApply_DedupesReciprocalViews(t *testing.T) {
++	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
++	g := NewGraph(time.Hour)
++	g.now = fixedTime(now)
++
++	// Device A reports seeing B on its Eth1/1.
++	g.Apply(Observation{
++		LocalDevice:     "switch-a",
++		LocalIfName:     "Eth1/1",
++		LocalIfIndex:    101,
++		RemoteDevice:    "switch-b",
++		RemoteIfName:    "Eth2/2",
++		NeighborSources: []string{"lldp"},
++		Timestamp:       now,
++	})
++	// Device B reports the reciprocal view.
++	g.Apply(Observation{
++		LocalDevice:     "switch-b",
++		LocalIfName:     "Eth2/2",
++		LocalIfIndex:    202,
++		RemoteDevice:    "switch-a",
++		RemoteIfName:    "Eth1/1",
++		NeighborSources: []string{"cdp"},
++		Timestamp:       now,
++	})
++
++	snap := g.Snapshot()
++	if snap.Counts["devices"] != 2 {
++		t.Errorf("want 2 devices, got %d", snap.Counts["devices"])
++	}
++	if snap.Counts["links"] != 1 {
++		t.Fatalf("reciprocal views should collapse into 1 link, got %d", snap.Counts["links"])
++	}
++	if len(snap.Edges) != 1 {
++		t.Fatalf("want 1 edge, got %d", len(snap.Edges))
++	}
++	edge := snap.Edges[0]
++	if len(edge.Sources) != 2 || edge.Sources[0] != "cdp" || edge.Sources[1] != "lldp" {
++		t.Errorf("expected edge sources [cdp,lldp], got %v", edge.Sources)
++	}
++
++	// Nodes should include both devices plus two interfaces (one per side).
++	devCount, ifCount := 0, 0
++	for _, n := range snap.Nodes {
++		switch n.Kind {
++		case "device":
++			devCount++
++		case "interface":
++			ifCount++
++		}
++	}
++	if devCount != 2 || ifCount != 2 {
++		t.Errorf("want 2 devices + 2 interfaces, got %d + %d", devCount, ifCount)
++	}
++}
++
++func TestApply_MissingFieldsDropped(t *testing.T) {
++	g := NewGraph(time.Hour)
++	g.now = fixedTime(time.Now())
++
++	// No local device name.
++	g.Apply(Observation{LocalIfName: "Eth1", RemoteDevice: "r", RemoteIfName: "Eth2"})
++	// No remote device.
++	g.Apply(Observation{LocalDevice: "a", LocalIfName: "Eth1"})
++	// No interface name.
++	g.Apply(Observation{LocalDevice: "a", RemoteDevice: "b", RemoteIfName: "Eth2"})
++
++	snap := g.Snapshot()
++	if snap.Counts["links"] != 0 {
++		t.Errorf("want 0 links, got %d", snap.Counts["links"])
++	}
++	if snap.Counts["devices"] != 0 {
++		t.Errorf("incomplete observations should not produce devices, got %d", snap.Counts["devices"])
++	}
++}
++
++func TestSnapshot_PrunesStaleLinks(t *testing.T) {
++	base := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
++	g := NewGraph(10 * time.Minute)
++	g.now = fixedTime(base)
++
++	g.Apply(Observation{
++		LocalDevice:  "a",
++		LocalIfName:  "Eth1",
++		RemoteDevice: "b",
++		RemoteIfName: "Eth2",
++		Timestamp:    base,
++	})
++
++	// Advance wall clock past the TTL.
++	g.now = fixedTime(base.Add(30 * time.Minute))
++	snap := g.Snapshot()
++	if snap.Counts["links"] != 0 {
++		t.Errorf("stale link should be pruned, got %d", snap.Counts["links"])
++	}
++}
++
++func TestSnapshot_FreshLinksKeepNodes(t *testing.T) {
++	base := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
++	g := NewGraph(10 * time.Minute)
++	g.now = fixedTime(base)
++
++	g.Apply(Observation{
++		LocalDevice:  "a",
++		LocalIfName:  "Eth1",
++		RemoteDevice: "b",
++		RemoteIfName: "Eth2",
++		Timestamp:    base,
++	})
++
++	// Advance 5m — still inside the TTL.
++	g.now = fixedTime(base.Add(5 * time.Minute))
++	snap := g.Snapshot()
++	if snap.Counts["links"] != 1 {
++		t.Errorf("fresh link should survive, got %d", snap.Counts["links"])
++	}
++	if snap.Counts["devices"] != 2 {
++		t.Errorf("fresh devices should survive, got %d", snap.Counts["devices"])
++	}
++}
++
++func TestApply_UpdatesDeviceMetadata(t *testing.T) {
++	g := NewGraph(time.Hour)
++	g.now = fixedTime(time.Now())
++
++	// First observation: no IP, no sysDescr.
++	g.Apply(Observation{
++		LocalDevice:  "a",
++		LocalIfName:  "Eth1",
++		RemoteDevice: "b",
++		RemoteIfName: "Eth2",
++	})
++	// Second observation on the same device now has the IP.
++	g.Apply(Observation{
++		LocalDevice:   "a",
++		LocalDeviceIP: "10.0.0.1",
++		LocalSysDescr: "Cisco IOS",
++		LocalIfName:   "Eth2",
++		RemoteDevice:  "c",
++		RemoteIfName:  "Eth9",
++	})
++
++	snap := g.Snapshot()
++	var seenA bool
++	for _, n := range snap.Nodes {
++		if n.Kind == "device" && n.Label == "a" {
++			seenA = true
++			if n.IP != "10.0.0.1" {
++				t.Errorf("expected IP to be recorded, got %q", n.IP)
++			}
++			if n.SysDescr != "Cisco IOS" {
++				t.Errorf("expected sysDescr, got %q", n.SysDescr)
++			}
++		}
++	}
++	if !seenA {
++		t.Fatal("device a missing from snapshot")
++	}
++}
+diff --git a/cmd/ktranslate-topology/ingest.go b/cmd/ktranslate-topology/ingest.go
+new file mode 100644
+index 0000000..39598eb
+--- /dev/null
++++ b/cmd/ktranslate-topology/ingest.go
+@@ -0,0 +1,162 @@
++package main
++
++import (
++	"bytes"
++	"compress/gzip"
++	"encoding/json"
++	"fmt"
++	"io"
++	"strings"
++	"time"
++)
++
++// topologyEventType must match pkg/kt.KENTIK_EVENT_SNMP_TOPOLOGY. It's
++// hard-coded here so the viewer binary doesn't need to import all of
++// pkg/kt (which pulls in gosnmp and a long transitive chain).
++const topologyEventType = "KSnmpTopology"
++
++// rawRecord mirrors just enough of the kt.JCHF JSON shape to pull the
++// topology fields back out. Unknown fields are ignored so schema drift on
++// unrelated fields doesn't break ingest.
++type rawRecord struct {
++	EventType  string            `json:"eventType"`
++	DeviceName string            `json:"device_name"`
++	SrcAddr    string            `json:"src_addr"`
++	Timestamp  int64             `json:"timestamp"`
++	CustomStr  map[string]string `json:"custom_str"`
++	CustomBig  map[string]int64  `json:"custom_bigint"`
++}
++
++// ParseAndApply decodes a JSON payload produced by ktranslate's
++// -format=json sink, filters it down to topology records, and applies
++// each one to the graph. The payload is expected to be a JSON array of
++// JCHF records (what `json.Marshal(msgs)` produces in pkg/formats/json).
++// Gzip-compressed bodies are transparently decoded.
++//
++// Returns (accepted, total, err) where accepted counts records that
++// actually contributed to the graph and total counts everything in the
++// payload (including non-topology records we skipped).
++func ParseAndApply(body []byte, g *Graph) (int, int, error) {
++	if len(body) == 0 {
++		return 0, 0, nil
++	}
++
++	// Best-effort gzip detection. The http sink gzip flag lives on
++	// the main binary's side; we sniff the magic number instead of
++	// requiring the user to declare it.
++	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
++		r, err := gzip.NewReader(bytes.NewReader(body))
++		if err != nil {
++			return 0, 0, fmt.Errorf("gzip reader: %w", err)
++		}
++		defer r.Close()
++		decoded, err := io.ReadAll(r)
++		if err != nil {
++			return 0, 0, fmt.Errorf("gzip decode: %w", err)
++		}
++		body = decoded
++	}
++
++	var recs []rawRecord
++	if err := json.Unmarshal(body, &recs); err != nil {
++		// Also accept a single record (convenient for curl testing).
++		var single rawRecord
++		if err2 := json.Unmarshal(body, &single); err2 == nil {
++			recs = []rawRecord{single}
++		} else {
++			return 0, 0, fmt.Errorf("json decode: %w", err)
++		}
++	}
++
++	accepted := 0
++	for _, r := range recs {
++		if r.EventType != topologyEventType {
++			continue
++		}
++		obs, ok := observationFromRaw(r)
++		if !ok {
++			continue
++		}
++		g.Apply(obs)
++		accepted++
++	}
++	return accepted, len(recs), nil
++}
++
++// observationFromRaw lifts the topology-relevant fields out of a single
++// raw record. It returns ok=false when mandatory fields are missing.
++func observationFromRaw(r rawRecord) (Observation, bool) {
++	cs := r.CustomStr
++	cb := r.CustomBig
++
++	local := firstNonEmpty(r.DeviceName, r.SrcAddr)
++	if local == "" {
++		return Observation{}, false
++	}
++
++	localIfName := cs["local_if_name"]
++	if localIfName == "" {
++		return Observation{}, false
++	}
++
++	remote := firstNonEmpty(
++		cs["remote_sys_name"],
++		cs["remote_chassis_id"],
++		cs["remote_mgmt_addr"],
++	)
++	if remote == "" {
++		return Observation{}, false
++	}
++
++	remoteIf := firstNonEmpty(cs["remote_port_id"], cs["remote_port_desc"])
++	if remoteIf == "" {
++		// No port info — synthesise a placeholder so the link still
++		// terminates on a distinct interface node instead of floating.
++		remoteIf = "?"
++	}
++
++	sources := splitSources(cs["neighbor_source"])
++	ts := time.Unix(r.Timestamp, 0)
++	if r.Timestamp == 0 {
++		ts = time.Time{}
++	}
++
++	return Observation{
++		LocalDevice:     local,
++		LocalDeviceIP:   r.SrcAddr,
++		LocalIfName:     localIfName,
++		LocalIfIndex:    cb["local_if_index"],
++		RemoteDevice:    remote,
++		RemoteIfName:    remoteIf,
++		RemoteMgmtAddr:  cs["remote_mgmt_addr"],
++		NeighborSources: sources,
++		Timestamp:       ts,
++	}, true
++}
++
++// splitSources handles both the single-protocol ("lldp") and combined
++// ("lldp+cdp") neighbor_source values that parseLLDPNeighbors / mergeNeighbors
++// emit.
++func splitSources(s string) []string {
++	if s == "" {
++		return nil
++	}
++	parts := strings.Split(s, "+")
++	out := make([]string, 0, len(parts))
++	for _, p := range parts {
++		p = strings.TrimSpace(p)
++		if p != "" {
++			out = append(out, p)
++		}
++	}
++	return out
++}
++
++func firstNonEmpty(vs ...string) string {
++	for _, v := range vs {
++		if v != "" {
++			return v
++		}
++	}
++	return ""
++}
+diff --git a/cmd/ktranslate-topology/ingest_test.go b/cmd/ktranslate-topology/ingest_test.go
+new file mode 100644
+index 0000000..ca8f90f
+--- /dev/null
++++ b/cmd/ktranslate-topology/ingest_test.go
+@@ -0,0 +1,177 @@
++package main
++
++import (
++	"bytes"
++	"compress/gzip"
++	"encoding/json"
++	"testing"
++	"time"
++)
++
++// sampleRecord builds a JCHF-shaped map mirroring what ktranslate's
++// json formatter emits.
++func sampleRecord(local, localIf, remote, remoteIf, source string) map[string]interface{} {
++	return map[string]interface{}{
++		"eventType":   topologyEventType,
++		"device_name": local,
++		"src_addr":    "10.0.0.1",
++		"timestamp":   time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC).Unix(),
++		"custom_str": map[string]string{
++			"neighbor_source":   source,
++			"local_if_name":     localIf,
++			"remote_sys_name":   remote,
++			"remote_port_id":    remoteIf,
++			"remote_mgmt_addr":  "10.0.0.99",
++			"remote_chassis_id": "00:11:22:33:44:55",
++		},
++		"custom_bigint": map[string]int64{
++			"local_if_index": 101,
++		},
++	}
++}
++
++func mustMarshal(t *testing.T, v interface{}) []byte {
++	t.Helper()
++	b, err := json.Marshal(v)
++	if err != nil {
++		t.Fatalf("marshal: %v", err)
++	}
++	return b
++}
++
++func TestParseAndApply_AcceptsArrayPayload(t *testing.T) {
++	body := mustMarshal(t, []map[string]interface{}{
++		sampleRecord("a", "Eth1/1", "b", "Eth2/2", "lldp"),
++		sampleRecord("c", "Eth3/3", "d", "Eth4/4", "cdp"),
++	})
++	// Pin wall clock to the fixture timestamp so TTL pruning doesn't
++	// drop the observation out from under us.
++	fixedNow := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
++	g := NewGraph(time.Hour)
++	g.now = fixedTime(fixedNow)
++	accepted, total, err := ParseAndApply(body, g)
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if accepted != 2 || total != 2 {
++		t.Errorf("want 2 accepted/total, got %d/%d", accepted, total)
++	}
++	if n := g.Snapshot().Counts["devices"]; n != 4 {
++		t.Errorf("want 4 devices, got %d", n)
++	}
++}
++
++func TestParseAndApply_SkipsNonTopologyRecords(t *testing.T) {
++	topo := sampleRecord("a", "Eth1", "b", "Eth2", "lldp")
++	other := map[string]interface{}{
++		"eventType":   "KSnmpInterfaceMetadata",
++		"device_name": "a",
++		"custom_str":  map[string]string{"SysName": "a"},
++	}
++	body := mustMarshal(t, []map[string]interface{}{topo, other})
++
++	g := NewGraph(time.Hour)
++	accepted, total, err := ParseAndApply(body, g)
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if accepted != 1 {
++		t.Errorf("want 1 accepted, got %d", accepted)
++	}
++	if total != 2 {
++		t.Errorf("want 2 total, got %d", total)
++	}
++}
++
++func TestParseAndApply_GzipBody(t *testing.T) {
++	body := mustMarshal(t, []map[string]interface{}{
++		sampleRecord("a", "Eth1", "b", "Eth2", "lldp"),
++	})
++	var buf bytes.Buffer
++	gz := gzip.NewWriter(&buf)
++	if _, err := gz.Write(body); err != nil {
++		t.Fatalf("gzip write: %v", err)
++	}
++	if err := gz.Close(); err != nil {
++		t.Fatalf("gzip close: %v", err)
++	}
++
++	g := NewGraph(time.Hour)
++	accepted, _, err := ParseAndApply(buf.Bytes(), g)
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if accepted != 1 {
++		t.Errorf("want 1 accepted, got %d", accepted)
++	}
++}
++
++func TestParseAndApply_AcceptsSingleRecord(t *testing.T) {
++	body := mustMarshal(t, sampleRecord("a", "Eth1", "b", "Eth2", "lldp"))
++	g := NewGraph(time.Hour)
++	accepted, _, err := ParseAndApply(body, g)
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if accepted != 1 {
++		t.Errorf("want 1 accepted for single record, got %d", accepted)
++	}
++}
++
++func TestParseAndApply_EmptyBody(t *testing.T) {
++	g := NewGraph(time.Hour)
++	accepted, total, err := ParseAndApply(nil, g)
++	if err != nil {
++		t.Errorf("empty body should not error, got %v", err)
++	}
++	if accepted != 0 || total != 0 {
++		t.Errorf("want 0/0, got %d/%d", accepted, total)
++	}
++}
++
++func TestSplitSources_Combined(t *testing.T) {
++	if got := splitSources("lldp+cdp"); len(got) != 2 || got[0] != "lldp" || got[1] != "cdp" {
++		t.Errorf("want [lldp,cdp], got %v", got)
++	}
++	if got := splitSources("lldp"); len(got) != 1 || got[0] != "lldp" {
++		t.Errorf("want [lldp], got %v", got)
++	}
++	if got := splitSources(""); got != nil {
++		t.Errorf("want nil, got %v", got)
++	}
++}
++
++func TestObservationFromRaw_FillsAllFields(t *testing.T) {
++	r := rawRecord{
++		EventType:  topologyEventType,
++		DeviceName: "sw-1",
++		SrcAddr:    "10.0.0.1",
++		Timestamp:  time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC).Unix(),
++		CustomStr: map[string]string{
++			"neighbor_source":  "lldp+cdp",
++			"local_if_name":    "Eth1/1",
++			"remote_sys_name":  "peer",
++			"remote_port_id":   "Eth2/2",
++			"remote_mgmt_addr": "10.0.0.99",
++		},
++		CustomBig: map[string]int64{
++			"local_if_index": 101,
++		},
++	}
++	obs, ok := observationFromRaw(r)
++	if !ok {
++		t.Fatal("expected observation to be built")
++	}
++	if obs.LocalDevice != "sw-1" || obs.RemoteDevice != "peer" {
++		t.Errorf("device names wrong: %+v", obs)
++	}
++	if obs.LocalIfIndex != 101 {
++		t.Errorf("want ifIndex 101, got %d", obs.LocalIfIndex)
++	}
++	if len(obs.NeighborSources) != 2 {
++		t.Errorf("want 2 sources, got %v", obs.NeighborSources)
++	}
++	if obs.RemoteMgmtAddr != "10.0.0.99" {
++		t.Errorf("mgmt addr missing")
++	}
++}
+diff --git a/cmd/ktranslate-topology/main.go b/cmd/ktranslate-topology/main.go
+new file mode 100644
+index 0000000..5c4cb11
+--- /dev/null
++++ b/cmd/ktranslate-topology/main.go
+@@ -0,0 +1,74 @@
++// Command ktranslate-topology is a standalone viewer that turns
++// KSnmpTopology records emitted by the main ktranslate binary into a
++// live, auto-refreshing web page.
++//
++// Usage:
++//
++//	ktranslate-topology -listen :8082 -ttl 2h
++//
++// And point ktranslate's HTTP sink at the ingest endpoint:
++//
++//	ktranslate -format json -sinks http -http_url http://localhost:8082/ingest ...
++//
++// Open http://localhost:8082/ to see the graph.
++package main
++
++import (
++	"context"
++	"flag"
++	"log"
++	"net/http"
++	"os"
++	"os/signal"
++	"syscall"
++	"time"
++)
++
++func main() {
++	var (
++		listen = flag.String("listen", ":8082", "address to listen on for ingest + UI")
++		ttl    = flag.Duration("ttl", 2*time.Hour, "drop links not seen within this window")
++	)
++	flag.Parse()
++
++	logger := log.New(os.Stderr, "ktranslate-topology ", log.LstdFlags|log.Lmicroseconds)
++
++	g := NewGraph(*ttl)
++	srv := &Server{Graph: g, Log: logger}
++
++	httpSrv := &http.Server{
++		Addr:              *listen,
++		Handler:           srv.Handler(),
++		ReadHeaderTimeout: 10 * time.Second,
++	}
++
++	logger.Printf("listening on %s (link ttl: %s)", *listen, ttl)
++
++	// Run the HTTP server in a goroutine so we can react to signals.
++	errCh := make(chan error, 1)
++	go func() {
++		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
++			errCh <- err
++		}
++		close(errCh)
++	}()
++
++	sigCh := make(chan os.Signal, 1)
++	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
++
++	select {
++	case sig := <-sigCh:
++		logger.Printf("received %s, shutting down", sig)
++	case err := <-errCh:
++		if err != nil {
++			logger.Fatalf("http server failed: %v", err)
++		}
++		return
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	if err := httpSrv.Shutdown(ctx); err != nil {
++		logger.Printf("shutdown: %v", err)
++	}
++}
+diff --git a/cmd/ktranslate-topology/server.go b/cmd/ktranslate-topology/server.go
+new file mode 100644
+index 0000000..be28051
+--- /dev/null
++++ b/cmd/ktranslate-topology/server.go
+@@ -0,0 +1,98 @@
++package main
++
++import (
++	"embed"
++	"encoding/json"
++	"io"
++	"log"
++	"net/http"
++)
++
++//go:embed assets/*
++var assetsFS embed.FS
++
++// Server wires the graph store to the HTTP endpoints the viewer needs:
++//
++//	POST /ingest     — receive JCHF JSON from ktranslate's http sink
++//	GET  /graph.json — current graph snapshot (what the browser polls)
++//	GET  /           — the static HTML viewer
++//	GET  /healthz    — liveness probe
++type Server struct {
++	Graph *Graph
++	Log   *log.Logger
++}
++
++// Handler returns a net/http.Handler that routes all four endpoints.
++func (s *Server) Handler() http.Handler {
++	mux := http.NewServeMux()
++
++	mux.HandleFunc("/ingest", s.handleIngest)
++	mux.HandleFunc("/graph.json", s.handleGraph)
++	mux.HandleFunc("/healthz", s.handleHealthz)
++	mux.HandleFunc("/", s.handleIndex)
++
++	return mux
++}
++
++func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	// Cap the body at 16 MiB so a buggy upstream can't OOM us.
++	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 16<<20))
++	if err != nil {
++		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
++		return
++	}
++	accepted, total, err := ParseAndApply(body, s.Graph)
++	if err != nil {
++		s.logf("ingest parse error: %v", err)
++		http.Error(w, err.Error(), http.StatusBadRequest)
++		return
++	}
++	s.logf("ingest: accepted=%d total=%d", accepted, total)
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(map[string]int{
++		"accepted": accepted,
++		"total":    total,
++	})
++}
++
++func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet {
++		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	snap := s.Graph.Snapshot()
++	w.Header().Set("Content-Type", "application/json")
++	w.Header().Set("Cache-Control", "no-store")
++	if err := json.NewEncoder(w).Encode(snap); err != nil {
++		s.logf("graph encode error: %v", err)
++	}
++}
++
++func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
++	w.Header().Set("Content-Type", "text/plain")
++	_, _ = w.Write([]byte("ok"))
++}
++
++func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
++	if r.URL.Path != "/" {
++		http.NotFound(w, r)
++		return
++	}
++	data, err := assetsFS.ReadFile("assets/index.html")
++	if err != nil {
++		http.Error(w, "index not found", http.StatusInternalServerError)
++		return
++	}
++	w.Header().Set("Content-Type", "text/html; charset=utf-8")
++	_, _ = w.Write(data)
++}
++
++func (s *Server) logf(format string, args ...interface{}) {
++	if s.Log != nil {
++		s.Log.Printf(format, args...)
++	}
++}
+diff --git a/cmd/ktranslate-topology/server_test.go b/cmd/ktranslate-topology/server_test.go
+new file mode 100644
+index 0000000..c66f9b6
+--- /dev/null
++++ b/cmd/ktranslate-topology/server_test.go
+@@ -0,0 +1,109 @@
++package main
++
++import (
++	"bytes"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++)
++
++func newTestServer() *Server {
++	g := NewGraph(time.Hour)
++	// Pin wall clock to the fixture timestamp used by sampleRecord so
++	// TTL pruning doesn't drop test data.
++	g.now = func() time.Time { return time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC) }
++	return &Server{Graph: g}
++}
++
++func TestServer_IngestAndGraph(t *testing.T) {
++	srv := newTestServer()
++	h := srv.Handler()
++
++	// POST a single topology record.
++	body := mustMarshal(t, sampleRecord("sw-a", "Eth1", "sw-b", "Eth2", "lldp"))
++	req := httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewReader(body))
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("ingest: want 200, got %d (body=%s)", rec.Code, rec.Body.String())
++	}
++	var resp map[string]int
++	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
++		t.Fatalf("decode ingest response: %v", err)
++	}
++	if resp["accepted"] != 1 {
++		t.Errorf("want accepted=1, got %v", resp)
++	}
++
++	// GET the snapshot.
++	req = httptest.NewRequest(http.MethodGet, "/graph.json", nil)
++	rec = httptest.NewRecorder()
++	h.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("graph: want 200, got %d", rec.Code)
++	}
++	var snap Snapshot
++	if err := json.NewDecoder(rec.Body).Decode(&snap); err != nil {
++		t.Fatalf("decode snapshot: %v", err)
++	}
++	if snap.Counts["devices"] != 2 {
++		t.Errorf("want 2 devices, got %d", snap.Counts["devices"])
++	}
++	if snap.Counts["links"] != 1 {
++		t.Errorf("want 1 link, got %d", snap.Counts["links"])
++	}
++}
++
++func TestServer_IngestRejectsGET(t *testing.T) {
++	srv := newTestServer()
++	h := srv.Handler()
++
++	req := httptest.NewRequest(http.MethodGet, "/ingest", nil)
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusMethodNotAllowed {
++		t.Errorf("want 405, got %d", rec.Code)
++	}
++}
++
++func TestServer_IndexServesHTML(t *testing.T) {
++	srv := newTestServer()
++	h := srv.Handler()
++
++	req := httptest.NewRequest(http.MethodGet, "/", nil)
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("want 200, got %d", rec.Code)
++	}
++	ct := rec.Header().Get("Content-Type")
++	if !strings.HasPrefix(ct, "text/html") {
++		t.Errorf("want html content-type, got %q", ct)
++	}
++	if !strings.Contains(rec.Body.String(), "<svg") {
++		t.Errorf("expected the HTML to contain an <svg> root")
++	}
++}
++
++func TestServer_Healthz(t *testing.T) {
++	srv := newTestServer()
++	h := srv.Handler()
++
++	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusOK {
++		t.Errorf("want 200, got %d", rec.Code)
++	}
++	if rec.Body.String() != "ok" {
++		t.Errorf("want 'ok', got %q", rec.Body.String())
++	}
++}
+-- 
+2.43.0
+

@@ -1,0 +1,377 @@
+From 1155310ffa43983eb4c4aa15f1e8c5cf82eb03bf Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 11 Apr 2026 14:47:20 +0000
+Subject: [PATCH 1/9] ktranslate: add topology neighbor scaffolding
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Introduces the data model, config surface, and poll-loop wiring for
+LLDP/CDP-based device-to-device topology discovery. Adds kt.TopologyNeighbor
+and kt.NeighborSource, a Neighbors slice on kt.DeviceData, discover_neighbors
+and neighbor_protocols knobs on SnmpDeviceConfig, a new KSnmpTopology event
+type, and a PollTopology entry point gated off by default.
+
+pollLLDPNeighbors and pollCDPNeighbors are stubbed — the next commits add
+the real walks. Neighbors collected this way flow through the existing
+metadata JCHF channel, one record per link, so every sink picks them up
+with no extra wiring.
+---
+ pkg/inputs/snmp/metadata/poll.go     |  72 +++++++++-
+ pkg/inputs/snmp/metadata/topology.go | 192 +++++++++++++++++++++++++++
+ pkg/kt/snmp.go                       |  30 +++++
+ pkg/kt/types.go                      |   1 +
+ 4 files changed, 294 insertions(+), 1 deletion(-)
+ create mode 100644 vendor/ktranslate/pkg/inputs/snmp/metadata/topology.go
+
+diff --git a/pkg/inputs/snmp/metadata/poll.go b/pkg/inputs/snmp/metadata/poll.go
+index fb98a86..a3da809 100644
+--- a/pkg/inputs/snmp/metadata/poll.go
++++ b/pkg/inputs/snmp/metadata/poll.go
+@@ -193,6 +193,17 @@ func (p *Poller) PollSNMPMetadata(ctx context.Context) (*kt.DeviceData, error) {
+ 		deviceData.DeviceMetricsMetadata = deviceMetadata
+ 	}
+ 
++	if p.conf.DiscoverNeighbors {
++		neighbors, err := PollTopology(ctx, p.conf, p.server, deviceData.InterfaceData, p.log)
++		if err != nil {
++			// Topology errors are non-fatal — log and continue without neighbors.
++			p.log.Warnf("Topology discovery failed: %v", err)
++		} else if len(neighbors) > 0 {
++			deviceData.Neighbors = neighbors
++			p.log.Infof("Discovered %d topology neighbor(s)", len(neighbors))
++		}
++	}
++
+ 	return deviceData, nil
+ }
+ 
+@@ -338,7 +349,66 @@ func (p *Poller) toFlows(dd *kt.DeviceData) ([]*kt.JCHF, error) {
+ 		p.tcache = tcache
+ 	}
+ 
+-	return []*kt.JCHF{dst}, nil
++	out := []*kt.JCHF{dst}
++	if len(dd.Neighbors) > 0 {
++		out = append(out, p.neighborsToFlows(dd.Neighbors)...)
++	}
++	return out, nil
++}
++
++// neighborsToFlows emits one JCHF metadata record per discovered neighbor.
++// Each record is tagged with KENTIK_EVENT_SNMP_TOPOLOGY so downstream
++// consumers can distinguish topology events from regular metadata.
++func (p *Poller) neighborsToFlows(neighbors []kt.TopologyNeighbor) []*kt.JCHF {
++	out := make([]*kt.JCHF, 0, len(neighbors))
++	now := time.Now().Unix()
++	for _, n := range neighbors {
++		r := kt.NewJCHF()
++		r.CustomStr = make(map[string]string)
++		r.CustomInt = make(map[string]int32)
++		r.CustomBigInt = make(map[string]int64)
++		r.CustomMetrics = make(map[string]kt.MetricInfo)
++		r.EventType = kt.KENTIK_EVENT_SNMP_TOPOLOGY
++		r.Provider = p.conf.Provider
++		r.DeviceName = p.conf.DeviceName
++		r.SrcAddr = p.conf.DeviceIP
++		r.Timestamp = now
++
++		r.CustomStr["neighbor_source"] = string(n.Source)
++		if n.LocalIfIndex != 0 {
++			r.CustomBigInt["local_if_index"] = n.LocalIfIndex
++		}
++		if n.LocalIfName != "" {
++			r.CustomStr["local_if_name"] = n.LocalIfName
++		}
++		if n.RemoteChassisID != "" {
++			r.CustomStr["remote_chassis_id"] = n.RemoteChassisID
++		}
++		if n.RemoteSysName != "" {
++			r.CustomStr["remote_sys_name"] = n.RemoteSysName
++		}
++		if n.RemoteSysDesc != "" {
++			r.CustomStr["remote_sys_desc"] = n.RemoteSysDesc
++		}
++		if n.RemotePortID != "" {
++			r.CustomStr["remote_port_id"] = n.RemotePortID
++		}
++		if n.RemotePortDesc != "" {
++			r.CustomStr["remote_port_desc"] = n.RemotePortDesc
++		}
++		if n.RemoteMgmtAddr != "" {
++			r.CustomStr["remote_mgmt_addr"] = n.RemoteMgmtAddr
++		}
++		if n.RemoteCapabilities != "" {
++			r.CustomStr["remote_capabilities"] = n.RemoteCapabilities
++		}
++		if n.RemotePlatform != "" {
++			r.CustomStr["remote_platform"] = n.RemotePlatform
++		}
++
++		out = append(out, r)
++	}
++	return out
+ }
+ 
+ func (p *Poller) lookupMib(key string, isInterface bool) (*kt.Mib, bool) {
+diff --git a/pkg/inputs/snmp/metadata/topology.go b/pkg/inputs/snmp/metadata/topology.go
+new file mode 100644
+index 0000000..4070982
+--- /dev/null
++++ b/pkg/inputs/snmp/metadata/topology.go
+@@ -0,0 +1,192 @@
++package metadata
++
++import (
++	"context"
++
++	"github.com/gosnmp/gosnmp"
++
++	"github.com/kentik/ktranslate/pkg/eggs/logger"
++	snmp_util "github.com/kentik/ktranslate/pkg/inputs/snmp/util"
++	"github.com/kentik/ktranslate/pkg/kt"
++)
++
++// Topology OIDs.
++//
++// LLDP-MIB (IEEE 802.1AB):
++//   lldpLocPortEntry    .1.0.8802.1.1.2.1.3.7.1   (columns 2 subtype, 3 id, 4 desc)
++//   lldpRemEntry        .1.0.8802.1.1.2.1.4.1.1   (columns 4 chassisSubtype, 5 chassisId,
++//                                                  6 portSubtype, 7 portId, 8 portDesc,
++//                                                  9 sysName, 10 sysDesc, 12 capEnabled)
++//   lldpRemManAddrEntry .1.0.8802.1.1.2.1.4.2.1   (column 3 ifSubtype, 5 ifId — not walked here)
++//
++// CISCO-CDP-MIB:
++//   cdpCacheEntry       .1.3.6.1.4.1.9.9.23.1.2.1.1   indexed by (ifIndex, cdpCacheDeviceIndex)
++//                                                     (columns 3 addrType, 4 address, 5 version,
++//                                                      6 deviceId, 7 devicePort, 8 platform,
++//                                                      9 capabilities)
++const (
++	oidLLDPLocPortTable = "1.0.8802.1.1.2.1.3.7.1"
++	oidLLDPRemTable     = "1.0.8802.1.1.2.1.4.1.1"
++	oidCDPCacheTable    = "1.3.6.1.4.1.9.9.23.1.2.1.1"
++
++	neighborProtocolLLDP = "lldp"
++	neighborProtocolCDP  = "cdp"
++)
++
++// PollTopology walks LLDP and/or CDP tables on the device and returns the
++// list of discovered neighbors. The ifaces map (ifIndex-string -> InterfaceData)
++// is used to resolve LLDP local-port identifiers to concrete ifIndex values
++// and interface names; it may be nil or empty, in which case LLDP neighbors
++// fall back to reporting whatever local identifier the device exposed.
++//
++// Returns (nil, nil) when neighbor discovery is disabled for the device.
++func PollTopology(ctx context.Context, conf *kt.SnmpDeviceConfig, server *gosnmp.GoSNMP, ifaces map[string]*kt.InterfaceData, log logger.ContextL) ([]kt.TopologyNeighbor, error) {
++	if conf == nil || !conf.DiscoverNeighbors {
++		return nil, nil
++	}
++
++	protos := selectedNeighborProtocols(conf)
++	var neighbors []kt.TopologyNeighbor
++
++	if protos[neighborProtocolLLDP] {
++		lldp, err := pollLLDPNeighbors(ctx, conf, server, ifaces, log)
++		if err != nil {
++			log.Warnf("LLDP neighbor walk failed: %v", err)
++		} else {
++			neighbors = append(neighbors, lldp...)
++		}
++	}
++
++	if protos[neighborProtocolCDP] {
++		cdp, err := pollCDPNeighbors(ctx, conf, server, ifaces, log)
++		if err != nil {
++			log.Warnf("CDP neighbor walk failed: %v", err)
++		} else {
++			neighbors = append(neighbors, cdp...)
++		}
++	}
++
++	return mergeNeighbors(neighbors), nil
++}
++
++// selectedNeighborProtocols returns a set of enabled protocols. An empty
++// NeighborProtocols list means "both LLDP and CDP".
++func selectedNeighborProtocols(conf *kt.SnmpDeviceConfig) map[string]bool {
++	out := map[string]bool{}
++	if len(conf.NeighborProtocols) == 0 {
++		out[neighborProtocolLLDP] = true
++		out[neighborProtocolCDP] = true
++		return out
++	}
++	for _, p := range conf.NeighborProtocols {
++		switch p {
++		case neighborProtocolLLDP, neighborProtocolCDP:
++			out[p] = true
++		}
++	}
++	return out
++}
++
++// pollLLDPNeighbors is a stub until Stage 3. It intentionally performs no
++// walks so the Stage 1 wiring can land in isolation.
++func pollLLDPNeighbors(ctx context.Context, conf *kt.SnmpDeviceConfig, server *gosnmp.GoSNMP, ifaces map[string]*kt.InterfaceData, log logger.ContextL) ([]kt.TopologyNeighbor, error) {
++	_ = ctx
++	_ = conf
++	_ = server
++	_ = ifaces
++	_ = log
++	_ = snmp_util.WalkOID // keep the import hooked up for Stage 3
++	return nil, nil
++}
++
++// pollCDPNeighbors is a stub until Stage 2.
++func pollCDPNeighbors(ctx context.Context, conf *kt.SnmpDeviceConfig, server *gosnmp.GoSNMP, ifaces map[string]*kt.InterfaceData, log logger.ContextL) ([]kt.TopologyNeighbor, error) {
++	_ = ctx
++	_ = conf
++	_ = server
++	_ = ifaces
++	_ = log
++	return nil, nil
++}
++
++// mergeNeighbors collapses adjacent records that refer to the same link but
++// were reported by different protocols (LLDP+CDP). Two neighbors match when
++// they share local ifIndex (or local ifName when ifIndex is unknown) plus
++// remote sysName (when known) or remote chassis id / remote port id.
++func mergeNeighbors(in []kt.TopologyNeighbor) []kt.TopologyNeighbor {
++	if len(in) < 2 {
++		return in
++	}
++	out := make([]kt.TopologyNeighbor, 0, len(in))
++	used := make([]bool, len(in))
++	for i := range in {
++		if used[i] {
++			continue
++		}
++		cur := in[i]
++		for j := i + 1; j < len(in); j++ {
++			if used[j] {
++				continue
++			}
++			if neighborsMatch(cur, in[j]) {
++				cur = combineNeighbors(cur, in[j])
++				used[j] = true
++			}
++		}
++		out = append(out, cur)
++	}
++	return out
++}
++
++func neighborsMatch(a, b kt.TopologyNeighbor) bool {
++	if a.Source == b.Source {
++		return false // same-protocol duplicates are kept as-is
++	}
++	// Require the same local port.
++	if a.LocalIfIndex != 0 && b.LocalIfIndex != 0 {
++		if a.LocalIfIndex != b.LocalIfIndex {
++			return false
++		}
++	} else if a.LocalIfName != "" && b.LocalIfName != "" {
++		if a.LocalIfName != b.LocalIfName {
++			return false
++		}
++	} else {
++		return false
++	}
++	// And the same remote end (at least one positive signal).
++	switch {
++	case a.RemoteSysName != "" && b.RemoteSysName != "":
++		return a.RemoteSysName == b.RemoteSysName
++	case a.RemoteChassisID != "" && b.RemoteChassisID != "":
++		return a.RemoteChassisID == b.RemoteChassisID
++	case a.RemotePortID != "" && b.RemotePortID != "":
++		return a.RemotePortID == b.RemotePortID
++	}
++	return false
++}
++
++func combineNeighbors(a, b kt.TopologyNeighbor) kt.TopologyNeighbor {
++	merged := a
++	merged.Source = kt.NeighborSourceBoth
++	if merged.LocalIfIndex == 0 {
++		merged.LocalIfIndex = b.LocalIfIndex
++	}
++	merged.LocalIfName = pickNonEmpty(merged.LocalIfName, b.LocalIfName)
++	merged.RemoteChassisID = pickNonEmpty(merged.RemoteChassisID, b.RemoteChassisID)
++	merged.RemoteSysName = pickNonEmpty(merged.RemoteSysName, b.RemoteSysName)
++	merged.RemoteSysDesc = pickNonEmpty(merged.RemoteSysDesc, b.RemoteSysDesc)
++	merged.RemotePortID = pickNonEmpty(merged.RemotePortID, b.RemotePortID)
++	merged.RemotePortDesc = pickNonEmpty(merged.RemotePortDesc, b.RemotePortDesc)
++	merged.RemoteMgmtAddr = pickNonEmpty(merged.RemoteMgmtAddr, b.RemoteMgmtAddr)
++	merged.RemoteCapabilities = pickNonEmpty(merged.RemoteCapabilities, b.RemoteCapabilities)
++	merged.RemotePlatform = pickNonEmpty(merged.RemotePlatform, b.RemotePlatform)
++	return merged
++}
++
++func pickNonEmpty(a, b string) string {
++	if a != "" {
++		return a
++	}
++	return b
++}
+diff --git a/pkg/kt/snmp.go b/pkg/kt/snmp.go
+index ae335e0..0987567 100644
+--- a/pkg/kt/snmp.go
++++ b/pkg/kt/snmp.go
+@@ -30,6 +30,34 @@ type DeviceData struct {
+ 	Manufacturer          string                    `yaml:"manufacturer"`
+ 	InterfaceData         map[string]*InterfaceData `yaml:"interface_data"`
+ 	DeviceMetricsMetadata *DeviceMetricsMetadata    `yaml:"device_metrics_metadata,omitempty"`
++	Neighbors             []TopologyNeighbor        `yaml:"neighbors,omitempty"`
++}
++
++// NeighborSource identifies which discovery protocol reported a neighbor.
++// When the same link is reported by both LLDP and CDP it's collapsed into
++// NeighborSourceBoth.
++type NeighborSource string
++
++const (
++	NeighborSourceLLDP NeighborSource = "lldp"
++	NeighborSourceCDP  NeighborSource = "cdp"
++	NeighborSourceBoth NeighborSource = "lldp+cdp"
++)
++
++// TopologyNeighbor is a single device-to-device adjacency discovered via
++// LLDP-MIB or CISCO-CDP-MIB during an SNMP metadata poll.
++type TopologyNeighbor struct {
++	Source             NeighborSource `yaml:"source"`
++	LocalIfIndex       int64          `yaml:"local_if_index,omitempty"`
++	LocalIfName        string         `yaml:"local_if_name,omitempty"`
++	RemoteChassisID    string         `yaml:"remote_chassis_id,omitempty"`
++	RemoteSysName      string         `yaml:"remote_sys_name,omitempty"`
++	RemoteSysDesc      string         `yaml:"remote_sys_desc,omitempty"`
++	RemotePortID       string         `yaml:"remote_port_id,omitempty"`
++	RemotePortDesc     string         `yaml:"remote_port_desc,omitempty"`
++	RemoteMgmtAddr     string         `yaml:"remote_mgmt_addr,omitempty"`
++	RemoteCapabilities string         `yaml:"remote_capabilities,omitempty"`
++	RemotePlatform     string         `yaml:"remote_platform,omitempty"`
+ }
+ 
+ type DeviceTableMetadata struct {
+@@ -211,6 +239,8 @@ type SnmpDeviceConfig struct {
+ 	MatchAttr           map[string]string `yaml:"match_attributes"`
+ 	MonitorAdminShut    bool              `yaml:"monitor_admin_shut"`
+ 	NoUseBulkWalkAll    bool              `yaml:"no_use_bulkwalkall"`
++	DiscoverNeighbors   bool              `yaml:"discover_neighbors,omitempty"` // Collect LLDP/CDP adjacency data during metadata polls.
++	NeighborProtocols   []string          `yaml:"neighbor_protocols,omitempty"` // Subset of {"lldp","cdp"}; empty means both when DiscoverNeighbors is true.
+ 	InstrumentationName string            `yaml:"instrumentationName,omitempty"`
+ 	RunPing             bool              `yaml:"response_time,omitempty"`
+ 	Ext                 *ExtensionSet     `yaml:"ext,omitempty"`
+diff --git a/pkg/kt/types.go b/pkg/kt/types.go
+index 180e5a4..d0af10d 100644
+--- a/pkg/kt/types.go
++++ b/pkg/kt/types.go
+@@ -25,6 +25,7 @@ const (
+ 	KENTIK_EVENT_SNMP_DEV_METRIC = "KSnmpDeviceMetric"
+ 	KENTIK_EVENT_SNMP_INT_METRIC = "KSnmpInterfaceMetric"
+ 	KENTIK_EVENT_SNMP_METADATA   = "KSnmpInterfaceMetadata"
++	KENTIK_EVENT_SNMP_TOPOLOGY   = "KSnmpTopology"
+ 	KENTIK_EVENT_SNMP_TRAP       = "KSnmpTrap"
+ 	KENTIK_EVENT_EXT             = "KExtEvent"
+ 	KENTIK_EVENT_JSON            = "KJson"
+-- 
+2.43.0
+

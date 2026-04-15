@@ -1,0 +1,616 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"net"
+	"net/http"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	synthetics "github.com/kentik/api-schema-public/gen/go/kentik/synthetics/v202309"
+	"github.com/kentik/ktranslate"
+	"github.com/kentik/ktranslate/pkg/eggs/logger"
+	"github.com/kentik/ktranslate/pkg/kt"
+	"github.com/kentik/ktranslate/pkg/version"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+)
+
+const (
+	CACHE_TIME_DEVICE             = 1 * time.Hour
+	API_TIMEOUT                   = 60 * time.Second
+	HTTP_USER_AGENT               = "User-Agent"
+	API_EMAIL_HEADER              = "X-CH-Auth-Email"
+	API_PASSWORD_HEADER           = "X-CH-Auth-API-Token"
+	MIN_TIME_BETWEEN_SYNTH_CHECKS = 60 * time.Second
+)
+
+var (
+	apiDeviceFile string
+)
+
+func init() {
+	flag.StringVar(&apiDeviceFile, "api_device_file", "", "File to sideload devices without hitting API")
+}
+
+type KentikApi struct {
+	logger.ContextL
+	tr            *http.Transport
+	client        *http.Client
+	devices       map[kt.Cid]kt.Devices
+	synAgents     map[kt.AgentId]*synthetics.Agent
+	synAgentsByIP map[string]*synthetics.Agent
+	synTests      map[kt.TestId]*synthetics.Test
+	setTime       time.Time
+	apiTimeout    time.Duration
+	synClient     synthetics.SyntheticsAdminServiceClient
+	mux           sync.RWMutex
+	lastSynth     time.Time
+	config        *ktranslate.Config
+}
+
+func NewKentikApi(ctx context.Context, log logger.ContextL, cfg *ktranslate.Config) (*KentikApi, error) {
+	apiTimeoutStr := os.Getenv(kt.KentikAPITimeout)
+	apiTimeout := API_TIMEOUT
+	if apiTimeoutStr != "" {
+		intv, _ := strconv.Atoi(apiTimeoutStr)
+		apiTimeout = time.Duration(intv) * time.Second
+	}
+	log.Infof("Setting API timeout to %v", apiTimeout)
+
+	tr := &http.Transport{
+		DisableCompression: false,
+		DisableKeepAlives:  false,
+		Dial: (&net.Dialer{
+			Timeout: apiTimeout,
+		}).Dial,
+		TLSHandshakeTimeout: apiTimeout,
+	}
+	client := &http.Client{Transport: tr, Timeout: apiTimeout}
+
+	kapi := &KentikApi{
+		ContextL:   log,
+		tr:         tr,
+		client:     client,
+		apiTimeout: apiTimeout,
+		config:     cfg,
+	}
+
+	// Now, check to see if synthetics API works.
+	err := kapi.connectSynth(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// check api works and also pre-populate cache.
+	err = kapi.getDevices(ctx)
+
+	// Drop cache every hour to keep up to date
+	go kapi.manageCache(ctx)
+
+	return kapi, err
+}
+
+func (api *KentikApi) getDeviceInfo(ctx context.Context, apiUrl string, apiEmail string, apiToken string) ([]byte, error) {
+	if apiEmail == "" {
+		if v := api.config.API.DeviceFile; v != "" {
+			api.Infof("Reading devices from local file: %s", v)
+			return os.ReadFile(v)
+		}
+	}
+
+	// Try to make a request, parse the result as json.
+	req, err := http.NewRequestWithContext(ctx, "GET", apiUrl, nil)
+	if err != nil {
+		api.Errorf("Error with Launcher: %v", err)
+		return nil, err
+	}
+
+	req.Header.Add(API_EMAIL_HEADER, apiEmail)
+	req.Header.Add(API_PASSWORD_HEADER, apiToken)
+	req.Header.Add(HTTP_USER_AGENT, userAgent())
+
+	resp, err := api.client.Do(req)
+	if err != nil {
+		api.Errorf("Error with Launcher: %v", err)
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		api.Errorf("Error with Launcher: %v", err)
+		api.client = &http.Client{Transport: api.tr, Timeout: api.apiTimeout}
+		return nil, err
+	} else if resp.StatusCode == 404 {
+		// This should mean that the device is no longer valid -- it's been deleted,
+		// or the company has expired, or some similar issue.  We'll stop the flow at
+		// chfproxy-relay, anyway, but it's important to bring down the client agent
+		// here so that if the customer deletes a device and then adds a new version
+		// of it with the same sending-ip, we'll re-do the lookup and start treating
+		// the flow as the new device.  So log the error we received, but don't return
+		// an error -- return an empty json block.
+		api.Warnf("Received a %d error from API: %s", resp.StatusCode, body)
+		return []byte("{}"), nil
+	} else if resp.StatusCode == 403 {
+		// This should mean that the credentials that the agent was started with have become
+		// invalid while the agent was running.  If this is true, we've decided to stop sending
+		// flow from all device, in order to attract attention to the issue; otherwise, we
+		// could keep sending flow indefinitely (as long as we keep sending flow, proxy-relay
+		// doesn't have to re-authenticate), but couldn't add new devices, and all flow could be
+		// cut off by a later proxy-relay restart.  Better to fail quickly.
+		api.Warnf("Received a %d error from API: %s", resp.StatusCode, body)
+		return []byte("{}"), nil
+	} else if resp.StatusCode >= 300 {
+		err = fmt.Errorf("HTTP error: status code %d, body %v", resp.StatusCode, string(body))
+		api.Errorf("Lookup failed: %v", err)
+		return nil, err
+	}
+
+	return body, nil
+}
+
+func (api *KentikApi) UpdateTests(ctx context.Context) {
+	if api == nil || api.config == nil || len(api.config.KentikCreds) == 0 {
+		return
+	}
+
+	if time.Now().Before(api.lastSynth.Add(MIN_TIME_BETWEEN_SYNTH_CHECKS)) { // Only check this often.
+		return
+	}
+
+	go func() {
+		err := api.getSynthInfo(ctx)
+		if err != nil {
+			api.Errorf("Cannot get API synth on demand: %v", err)
+		}
+	}()
+	return
+}
+
+func (api *KentikApi) GetTest(tid kt.TestId) *synthetics.Test {
+	if api == nil {
+		return nil
+	}
+	return api.synTests[tid]
+}
+
+func (api *KentikApi) GetAgent(aid kt.AgentId) *synthetics.Agent {
+	if api == nil {
+		return nil
+	}
+	return api.synAgents[aid]
+}
+
+func (api *KentikApi) GetAgentByIP(ip string) *synthetics.Agent {
+	if api == nil {
+		return nil
+	}
+	return api.synAgentsByIP[ip]
+}
+
+func (api *KentikApi) GetDevicesAsMap(cid kt.Cid) map[string]*kt.Device {
+	if api == nil {
+		return nil
+	}
+	res := map[string]*kt.Device{}
+	if cid == 0 {
+		for _, cd := range api.devices {
+			for _, d := range cd {
+				for _, ip := range d.SendingIps {
+					res[ip.String()] = d
+				}
+			}
+		}
+	} else {
+		for _, d := range api.devices[cid] {
+			for _, ip := range d.SendingIps {
+				res[ip.String()] = d
+			}
+		}
+	}
+	return res
+}
+
+func (api *KentikApi) GetDevice(cid kt.Cid, did kt.DeviceID) *kt.Device {
+	if api == nil {
+		return nil
+	}
+	if c, ok := api.devices[cid]; ok {
+		return c[did]
+	}
+	return nil
+}
+
+func (api *KentikApi) getInterfaces(ctx context.Context, did kt.DeviceID, info ktranslate.KentikCred) ([]kt.Interface, error) {
+	res, err := api.getDeviceInfo(ctx, fmt.Sprintf(api.config.APIBaseURL+"/api/internal/device/%d/interfaces", did), info.APIEmail, info.APIToken)
+	if err != nil {
+		return nil, err
+	}
+	interfaces := []kt.Interface{}
+	err = json.Unmarshal(res, &interfaces)
+	return interfaces, err
+}
+
+func (api *KentikApi) getDevices(ctx context.Context) error {
+	stime := time.Now()
+	resDev := map[kt.Cid]kt.Devices{}
+	num := 0
+	for _, info := range api.config.KentikCreds {
+		res, err := api.getDeviceInfo(ctx, api.config.APIBaseURL+"/api/internal/devices", info.APIEmail, info.APIToken)
+		if err != nil {
+			return err
+		}
+		var devices kt.DeviceList
+		err = json.Unmarshal(res, &devices)
+		if err != nil {
+			return err
+		}
+
+		for _, device := range devices.Devices {
+			myd := device
+			if _, ok := resDev[device.CompanyID]; !ok {
+				resDev[device.CompanyID] = map[kt.DeviceID]*kt.Device{}
+			}
+			myd.Interfaces = map[kt.IfaceID]kt.Interface{}
+			interfaces, err := api.getInterfaces(ctx, device.ID, info)
+			if err != nil {
+				api.Errorf("Cannot get interfaces for %v: %v", device.Name, err)
+			} else {
+				for _, intf := range interfaces {
+					intfl := intf // Should this be a pointer?
+					myd.Interfaces[intf.SnmpID] = intfl
+				}
+			}
+			resDev[device.CompanyID][device.ID] = &myd
+			num++
+		}
+
+		api.Infof("Loaded %d Kentik devices via API for %s", len(devices.Devices), info.APIEmail)
+	}
+
+	api.setTime = time.Now()
+	api.Infof("Loaded %d Kentik devices via API in %v", num, api.setTime.Sub(stime))
+	api.devices = resDev
+
+	// Now pull in site info for these devices.
+	err := api.getSites(ctx)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (api *KentikApi) getSites(ctx context.Context) error {
+	stime := time.Now()
+	num := 0
+	mapped := 0
+	siteMap := map[int]*kt.FullSite{}
+	for _, info := range api.config.KentikCreds {
+		res, err := api.getDeviceInfo(ctx, api.config.GRPCBaseURL+"/site/v202509/sites", info.APIEmail, info.APIToken)
+		if err != nil {
+			return err
+		}
+		var sites kt.SiteList
+		err = json.Unmarshal(res, &sites)
+		if err != nil {
+			return err
+		}
+
+		for _, site := range sites.Sites {
+			if idInt, err := strconv.Atoi(site.ID); err == nil {
+				ls := site
+				siteMap[idInt] = &ls
+				num++
+			}
+		}
+
+		// Now map sites into devices.
+		for _, cd := range api.devices {
+			for _, d := range cd {
+				if ds, ok := siteMap[d.Site.ID]; ok {
+					d.FullSite = ds
+					mapped++
+				}
+			}
+		}
+	}
+
+	api.setTime = time.Now()
+	api.Infof("Loaded %d Kentik sites via API in %v, mapped to %d devices", num, api.setTime.Sub(stime), mapped)
+	return nil
+}
+
+func NewKentikApiFromLocalDevices(localDevices map[string]*kt.Device, log logger.ContextL) *KentikApi {
+	if localDevices == nil {
+		return nil
+	}
+
+	api := &KentikApi{
+		ContextL: log,
+	}
+
+	resDev := map[kt.Cid]kt.Devices{}
+	num := 0
+	for _, devicel := range localDevices {
+		device := devicel
+		if _, ok := resDev[device.CompanyID]; !ok {
+			resDev[device.CompanyID] = map[kt.DeviceID]*kt.Device{}
+		}
+		device.Interfaces = map[kt.IfaceID]kt.Interface{}
+		for _, intf := range device.AllInterfaces {
+			device.Interfaces[intf.SnmpID] = intf
+		}
+		resDev[device.CompanyID][device.ID] = device
+		num++
+	}
+
+	api.setTime = time.Now()
+	api.Infof("Loaded %d Kentik devices via local file", num)
+	api.devices = resDev
+
+	return api
+}
+
+func (api *KentikApi) manageCache(ctx context.Context) {
+	checkTicker := time.NewTicker(CACHE_TIME_DEVICE)
+	defer checkTicker.Stop()
+
+	for {
+		select {
+		case _ = <-checkTicker.C:
+			err := api.getDevices(ctx)
+			if err != nil {
+				api.Errorf("Cannot get API devices: %v", err)
+			}
+			err = api.getSynthInfo(ctx)
+			if err != nil {
+				api.Errorf("Cannot get API synth: %v", err)
+			}
+
+		case <-ctx.Done():
+			api.Infof("manageApiCache Done")
+			return
+		}
+	}
+}
+
+// clientKeepAlive maintains active gRPC connections with the Kentik API Gateway,
+// even during periods of no application traffic. This is primarily to prevent
+// proxies from terminating idle connections, a common issue for agents deployed
+// behind certain customer network configurations. Configuring this for all agents
+// is harmless and recommended.
+//
+// Note: The API Gateway directly responds to these keep-alive pings and does
+// not forward them to the backend API. Consequently, the gRPC server-side
+// `keepalive.EnforcementPolicy` (e.g., from `grpc-go/keepalive/keepalive.go`)
+// will not function as expected for these client-initiated pings, as its
+// enforcement applies between the API Gateway and the actual API.
+//
+// See https://github.com/grpc/grpc-go/blob/v1.62.0/keepalive/keepalive.go#L77
+// Copied from https://github.com/kentik/kagent
+func (api *KentikApi) getClientKeepAlive() keepalive.ClientParameters {
+	return keepalive.ClientParameters{
+		Time:                30 * time.Second, // send pings every 30 seconds if there is no activity
+		Timeout:             api.apiTimeout,   // wait KENTIK_API_TIMEOUT or default 60 seconds for ping ack before considering the connection dead
+		PermitWithoutStream: true,             // send pings even without active streams
+	}
+}
+
+func (api *KentikApi) connectSynth(ctxIn context.Context) error {
+
+	ctx, cancel := context.WithTimeout(ctxIn, api.apiTimeout)
+	defer cancel()
+
+	creds, err := clientTransportCredentials(true, "", "", "")
+	if err != nil {
+		return err
+	}
+
+	address, err := getAddressFromApiRoot(api.config.APIBaseURL)
+	if err != nil {
+		return err
+	}
+
+	api.Infof("Connecting to API server at %s", address)
+	opts := []grpc.DialOption{
+		grpc.WithUserAgent(userAgent()),
+		grpc.WithKeepaliveParams(api.getClientKeepAlive()),
+		grpc.WithTransportCredentials(creds),
+	}
+
+	conn, err := grpc.NewClient(address, opts...)
+	if err != nil {
+		return err
+	}
+
+	client := synthetics.NewSyntheticsAdminServiceClient(conn)
+	api.Infof("Connected to Synth API server at %s", address)
+	api.synClient = client
+
+	return api.getSynthInfo(ctx)
+}
+
+func (api *KentikApi) getSynthInfo(ctx context.Context) error {
+	api.mux.Lock() // Guard this function totally.
+	defer api.mux.Unlock()
+	api.lastSynth = time.Now()
+
+	synTests := map[kt.TestId]*synthetics.Test{}
+	synAgents := map[kt.AgentId]*synthetics.Agent{}
+	synAgentsByIP := map[string]*synthetics.Agent{}
+	for _, info := range api.config.KentikCreds {
+		md := metadata.New(map[string]string{
+			"X-CH-Auth-Email":     info.APIEmail,
+			"X-CH-Auth-API-Token": info.APIToken,
+		})
+		ctxo := metadata.NewOutgoingContext(ctx, md)
+
+		lt := &synthetics.ListTestsRequest{}
+		r, err := api.synClient.ListTests(ctxo, lt)
+		if err != nil {
+			if status.Code(err) == codes.Unimplemented {
+				api.Warnf("Synthetics ListTests endpoint not implemented (deprecated API); skipping.")
+				return nil
+			}
+			return err
+		}
+
+		for _, test := range r.GetTests() {
+			localt := test
+			synTests[kt.NewTestId(test.GetId())] = localt
+		}
+
+		la := &synthetics.ListAgentsRequest{}
+		ra, err := api.synClient.ListAgents(ctxo, la)
+		if err != nil {
+			return err
+		}
+
+		for _, agent := range ra.GetAgents() {
+			locala := agent
+			synAgents[kt.NewAgentId(agent.GetId())] = locala
+			lip := locala.GetLocalIp() // Store local ip seperately from public one, if a local is set.
+			if lip != "" {
+				synAgentsByIP[lip] = locala
+			}
+			synAgentsByIP[locala.GetIp()] = locala
+		}
+
+		api.Infof("Loaded %d Kentik Tests and %d Agents via API for %s", len(r.GetTests()), len(ra.GetAgents()), info.APIEmail)
+	}
+
+	api.synAgents = synAgents
+	api.synAgentsByIP = synAgentsByIP
+	api.synTests = synTests
+	api.Infof("Loaded %d Kentik Tests and %d Agents Total via API", len(api.synTests), len(api.synAgents))
+
+	return nil
+}
+
+func (api *KentikApi) EnsureDevice(ctx context.Context, conf *kt.SnmpDeviceConfig) error {
+	if api == nil || api.config == nil || len(api.config.KentikCreds) == 0 {
+		return nil
+	}
+
+	// If there's no plan id to create devices on, just silently return here.
+	if api.config.KentikPlan == 0 {
+		return nil
+	}
+
+	// If the device isn't in the list of devices we have, return it too
+	dname := strings.ToLower(strings.Replace(conf.DeviceName, ".", "_", -1)) // Normalize to make the API happy.
+	for _, c := range api.devices {
+		for _, d := range c {
+			if d.Name == dname {
+				api.Infof("The %s device already exists in Kentik.")
+				return nil // No need to keep going.
+			}
+		}
+	}
+
+	desc := conf.Description
+	if len(desc) > 128 {
+		desc = desc[0:127]
+	}
+	api.Infof("Adding the %s device in Kentik.", dname)
+	dev := &deviceCreate{
+		Name:        dname,
+		Type:        "router",
+		Description: desc,
+		SampleRate:  1,
+		BgpType:     "none",
+		PlanID:      api.config.KentikPlan,
+		IPs:         []net.IP{net.ParseIP(conf.DeviceIP)},
+		Subtype:     "router",
+		MinSnmp:     false,
+	}
+
+	err := api.createDevice(ctx, dev, api.config.APIBaseURL+"/api/v5/device")
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (api *KentikApi) createDevice(ctx context.Context, create *deviceCreate, url string) error {
+	if len(api.config.KentikCreds) == 0 {
+		return fmt.Errorf("No API Credencials Specified.")
+	}
+
+	payload, err := json.Marshal(map[string]*deviceCreate{
+		"device": create,
+	})
+	if err != nil {
+		return err
+	}
+
+	// Try to make a request, parse the result as json.
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(payload))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Add(API_EMAIL_HEADER, api.config.KentikCreds[0].APIEmail)
+	req.Header.Add(API_PASSWORD_HEADER, api.config.KentikCreds[0].APIToken)
+	req.Header.Add(HTTP_USER_AGENT, userAgent())
+	req.Header.Add("Content-Type", "application/json")
+
+	resp, err := api.client.Do(req)
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+	if err != nil {
+		api.Errorf("Error with device create: %v", err)
+		api.client = &http.Client{Transport: api.tr, Timeout: api.apiTimeout}
+		return err
+	}
+	if resp.StatusCode != 201 {
+		bodymap := map[string]string{}
+		json.NewDecoder(resp.Body).Decode(&bodymap)
+		return fmt.Errorf("Invalid status code %d -> %v", resp.StatusCode, bodymap["error"])
+	}
+	io.Copy(ioutil.Discard, resp.Body)
+
+	return nil
+}
+
+type deviceCreate struct {
+	Name        string   `json:"device_name"`
+	Type        string   `json:"device_type"`
+	Description string   `json:"device_description"`
+	SampleRate  int      `json:"device_sample_rate,string"`
+	BgpType     string   `json:"device_bgp_type"`
+	PlanID      int      `json:"plan_id,omitempty"`
+	SiteID      int      `json:"site_id,omitempty"`
+	IPs         []net.IP `json:"sending_ips"`
+	CdnAttr     string   `json:"-"`
+	ExportId    int      `json:"cloud_export_id,omitempty"`
+	Subtype     string   `json:"device_subtype"`
+	Region      string   `json:"cloud_region,omitempty"`
+	Zone        string   `json:"cloud_zone,omitempty"`
+	MinSnmp     bool     `json:"minimize_snmp"`
+}
+
+func userAgent(comments ...string) string {
+	comments = append([]string{runtime.GOOS, runtime.GOARCH}, comments...)
+	return fmt.Sprintf("kentik/ktranslate/%s (%s)", version.Version.Version, strings.Join(comments, "; "))
+}

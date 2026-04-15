@@ -1,0 +1,575 @@
+From d34309c37515a81e81c0902f24c917d1194fd3c9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 11 Apr 2026 14:53:19 +0000
+Subject: [PATCH 3/9] ktranslate: implement LLDP neighbor walk
+
+Walks lldpLocPortEntry (1.0.8802.1.1.2.1.3.7.1) first to build a
+lldpLocalPortNum -> {subtype, id, desc} map, then lldpRemEntry
+(1.0.8802.1.1.2.1.4.1.1) for the actual neighbors. Chassis id and port
+id are decoded according to their subtypes (macAddress -> colon-hex,
+networkAddress -> dotted-quad for IPv4, local/interfaceName -> string,
+everything else -> printable-ASCII or hex fallback).
+
+Local port resolution matches the LLDP local-port identifier against
+the interface metadata already gathered in the same poll cycle:
+interfaceName -> ifDescr, interfaceAlias -> ifAlias, macAddress ->
+ifPhysAddress, with a generic lldpLocPortDesc -> ifDescr fallback for
+subtypes we can't resolve directly. Neighbors we can't resolve still
+surface with LocalIfName set to whatever the device exposed.
+
+Adds parser unit tests covering interfaceName/macAddress resolution,
+the description fallback, chassis id decoding, MAC formatting, and
+LLDP+CDP merge behaviour.
+---
+ pkg/inputs/snmp/metadata/topology.go      | 332 +++++++++++++++++++++-
+ pkg/inputs/snmp/metadata/topology_test.go | 190 +++++++++++++
+ 2 files changed, 514 insertions(+), 8 deletions(-)
+
+diff --git a/pkg/inputs/snmp/metadata/topology.go b/pkg/inputs/snmp/metadata/topology.go
+index 51c3cd1..ff8314d 100644
+--- a/pkg/inputs/snmp/metadata/topology.go
++++ b/pkg/inputs/snmp/metadata/topology.go
+@@ -91,15 +91,331 @@ func selectedNeighborProtocols(conf *kt.SnmpDeviceConfig) map[string]bool {
+ 	return out
+ }
+ 
+-// pollLLDPNeighbors is a stub until Stage 3. It intentionally performs no
+-// walks so the Stage 1 wiring can land in isolation.
++// LLDP lldpLocPortIdSubtype values from LLDP-MIB.
++const (
++	lldpSubtypeInterfaceAlias = 1
++	lldpSubtypePortComponent  = 2
++	lldpSubtypeMacAddress     = 3
++	lldpSubtypeNetworkAddress = 4
++	lldpSubtypeInterfaceName  = 5
++	lldpSubtypeAgentCircuitID = 6
++	lldpSubtypeLocal          = 7
++)
++
++// lldpLocPort captures the resolver inputs for one entry of lldpLocPortEntry.
++type lldpLocPort struct {
++	subtype int64
++	id      []byte
++	desc    string
++}
++
++// pollLLDPNeighbors walks lldpLocPortTable and lldpRemTable and returns
++// discovered neighbors. The ifaces map is used to map lldpLocalPortNum
++// (an opaque identifier) to a concrete local ifIndex / ifName.
+ func pollLLDPNeighbors(ctx context.Context, conf *kt.SnmpDeviceConfig, server *gosnmp.GoSNMP, ifaces map[string]*kt.InterfaceData, log logger.ContextL) ([]kt.TopologyNeighbor, error) {
+-	_ = ctx
+-	_ = conf
+-	_ = server
+-	_ = ifaces
+-	_ = log
+-	return nil, nil
++	// lldpLocPortEntry first — we need it to resolve local port numbers.
++	// Failure here isn't fatal: we can still report neighbors without a
++	// local ifIndex / ifName by leaving those fields zero.
++	var locPorts map[string]*lldpLocPort
++	locPDUs, err := snmp_util.WalkOID(ctx, conf, oidLLDPLocPortTable, server, log, "LLDPLocPort")
++	if err != nil {
++		log.Infof("LLDP local-port walk failed, proceeding without local-port resolution: %v", err)
++	} else {
++		locPorts = parseLLDPLocPorts(locPDUs, oidLLDPLocPortTable)
++	}
++
++	remPDUs, err := snmp_util.WalkOID(ctx, conf, oidLLDPRemTable, server, log, "LLDPRem")
++	if err != nil {
++		return nil, err
++	}
++	return parseLLDPNeighbors(remPDUs, oidLLDPRemTable, locPorts, ifaces), nil
++}
++
++// parseLLDPLocPorts builds a map keyed by the LLDP local-port-number (as a
++// decimal string) from a walk of lldpLocPortEntry.
++//
++// lldpLocPortEntry OID layout: .<base>.<col>.<lldpLocalPortNum>
++// Columns of interest: .2 subtype, .3 id, .4 desc.
++func parseLLDPLocPorts(pdus []gosnmp.SnmpPDU, base string) map[string]*lldpLocPort {
++	out := map[string]*lldpLocPort{}
++	get := func(k string) *lldpLocPort {
++		if p, ok := out[k]; ok {
++			return p
++		}
++		p := &lldpLocPort{}
++		out[k] = p
++		return p
++	}
++	for _, pdu := range pdus {
++		parts := trimOIDSuffix(pdu.Name, base)
++		if len(parts) < 2 {
++			continue
++		}
++		col := parts[0]
++		portNum := parts[len(parts)-1]
++		p := get(portNum)
++		switch col {
++		case "2":
++			p.subtype = gosnmp.ToBigInt(pdu.Value).Int64()
++		case "3":
++			if b, ok := pdu.Value.([]byte); ok && pdu.Type == gosnmp.OctetString {
++				p.id = b
++			}
++		case "4":
++			if s, ok := snmp_util.ReadOctetString(pdu, true); ok {
++				p.desc = s
++			}
++		}
++	}
++	return out
++}
++
++// parseLLDPNeighbors builds TopologyNeighbor records from a walk of
++// lldpRemEntry. It's split out from pollLLDPNeighbors for testability.
++//
++// lldpRemEntry OID layout:
++//
++//	.<base>.<col>.<lldpRemTimeMark>.<lldpLocalPortNum>.<lldpRemIndex>
++//
++// Columns of interest:
++//
++//	.4  lldpRemChassisIdSubtype (INTEGER)
++//	.5  lldpRemChassisId        (OCTET STRING, subtype-dependent encoding)
++//	.6  lldpRemPortIdSubtype    (INTEGER)
++//	.7  lldpRemPortId           (OCTET STRING, subtype-dependent encoding)
++//	.8  lldpRemPortDesc         (OCTET STRING)
++//	.9  lldpRemSysName          (OCTET STRING)
++//	.10 lldpRemSysDesc          (OCTET STRING)
++//	.12 lldpRemSysCapEnabled    (OCTET STRING, bit-packed)
++func parseLLDPNeighbors(pdus []gosnmp.SnmpPDU, base string, locPorts map[string]*lldpLocPort, ifaces map[string]*kt.InterfaceData) []kt.TopologyNeighbor {
++	type scratch struct {
++		chassisSubtype int64
++		chassisRaw     []byte
++		portSubtype    int64
++		portRaw        []byte
++		n              *kt.TopologyNeighbor
++	}
++
++	byKey := map[string]*scratch{}
++	order := []string{}
++
++	get := func(timeMark, locPort, remIdx string) *scratch {
++		key := timeMark + "." + locPort + "." + remIdx
++		if s, ok := byKey[key]; ok {
++			return s
++		}
++		s := &scratch{n: &kt.TopologyNeighbor{Source: kt.NeighborSourceLLDP, LocalIfName: locPort}}
++		// Record the raw local port number so callers see something even
++		// if resolution fails; it gets overwritten with the real ifName
++		// below.
++		byKey[key] = s
++		order = append(order, key)
++		return s
++	}
++
++	for _, pdu := range pdus {
++		parts := trimOIDSuffix(pdu.Name, base)
++		if len(parts) < 4 {
++			continue
++		}
++		col := parts[0]
++		// Last three are the (timeMark, locPort, remIdx) tuple.
++		timeMark := parts[len(parts)-3]
++		locPort := parts[len(parts)-2]
++		remIdx := parts[len(parts)-1]
++		s := get(timeMark, locPort, remIdx)
++
++		switch col {
++		case "4":
++			s.chassisSubtype = gosnmp.ToBigInt(pdu.Value).Int64()
++		case "5":
++			if b, ok := pdu.Value.([]byte); ok && pdu.Type == gosnmp.OctetString {
++				s.chassisRaw = b
++			}
++		case "6":
++			s.portSubtype = gosnmp.ToBigInt(pdu.Value).Int64()
++		case "7":
++			if b, ok := pdu.Value.([]byte); ok && pdu.Type == gosnmp.OctetString {
++				s.portRaw = b
++			}
++		case "8":
++			if v, ok := snmp_util.ReadOctetString(pdu, true); ok {
++				s.n.RemotePortDesc = v
++			}
++		case "9":
++			if v, ok := snmp_util.ReadOctetString(pdu, true); ok {
++				s.n.RemoteSysName = v
++			}
++		case "10":
++			if v, ok := snmp_util.ReadOctetString(pdu, true); ok {
++				s.n.RemoteSysDesc = v
++			}
++		case "12":
++			if v, ok := decodeCapabilityBits(pdu); ok {
++				s.n.RemoteCapabilities = v
++			}
++		}
++	}
++
++	out := make([]kt.TopologyNeighbor, 0, len(order))
++	for _, k := range order {
++		s := byKey[k]
++		// Finalize the chassis id / port id strings now that we have their subtypes.
++		s.n.RemoteChassisID = decodeLLDPChassisID(s.chassisSubtype, s.chassisRaw)
++		if pid := decodeLLDPPortID(s.portSubtype, s.portRaw); pid != "" {
++			s.n.RemotePortID = pid
++		}
++		// Resolve local ifIndex / ifName.
++		// key is "<timeMark>.<locPort>.<remIdx>"; pull the middle element.
++		keyParts := strings.Split(k, ".")
++		if len(keyParts) == 3 {
++			resolveLLDPLocal(s.n, keyParts[1], locPorts, ifaces)
++		}
++		out = append(out, *s.n)
++	}
++	return out
++}
++
++// resolveLLDPLocal fills LocalIfIndex and LocalIfName on the neighbor by
++// looking at the lldpLocPort entry for the given local port number and
++// matching it against the interface metadata collected earlier.
++func resolveLLDPLocal(n *kt.TopologyNeighbor, locPort string, locPorts map[string]*lldpLocPort, ifaces map[string]*kt.InterfaceData) {
++	info, ok := locPorts[locPort]
++	if !ok || info == nil {
++		// No local-port info. Leave LocalIfName as the raw LLDP port
++		// number so downstream consumers at least have something.
++		return
++	}
++	if info.desc != "" {
++		n.LocalIfName = info.desc
++	}
++
++	if ifaces == nil || len(ifaces) == 0 {
++		return
++	}
++
++	idStr := string(info.id)
++	switch info.subtype {
++	case lldpSubtypeInterfaceAlias:
++		for idx, d := range ifaces {
++			if d.Alias != "" && d.Alias == idStr {
++				setLocal(n, idx, d)
++				return
++			}
++		}
++	case lldpSubtypeInterfaceName:
++		for idx, d := range ifaces {
++			if d.Description != "" && d.Description == idStr {
++				setLocal(n, idx, d)
++				return
++			}
++		}
++	case lldpSubtypeMacAddress:
++		mac := formatMAC(info.id)
++		for idx, d := range ifaces {
++			if d.ExtraInfo == nil {
++				continue
++			}
++			if phys, ok := d.ExtraInfo[SNMP_ifPhysAddress]; ok && phys != "" && strings.EqualFold(phys, mac) {
++				setLocal(n, idx, d)
++				return
++			}
++		}
++	case lldpSubtypeLocal, lldpSubtypePortComponent, lldpSubtypeAgentCircuitID:
++		// Fall through to the description-based fallback below.
++	}
++
++	// Generic fallback: match lldpLocPortDesc against ifDescr.
++	if info.desc != "" {
++		for idx, d := range ifaces {
++			if d.Description == info.desc {
++				setLocal(n, idx, d)
++				return
++			}
++		}
++	}
++}
++
++func setLocal(n *kt.TopologyNeighbor, idxStr string, d *kt.InterfaceData) {
++	if i, err := strconv.ParseInt(idxStr, 10, 64); err == nil {
++		n.LocalIfIndex = i
++	}
++	if d.Description != "" {
++		n.LocalIfName = d.Description
++	}
++}
++
++// decodeLLDPChassisID renders a chassis id according to its subtype.
++// Subtype 4 (macAddress) is the most common on real gear; everything else
++// either comes through as a string or as hex when the bytes don't form a
++// printable string.
++func decodeLLDPChassisID(subtype int64, b []byte) string {
++	if len(b) == 0 {
++		return ""
++	}
++	switch subtype {
++	case 4: // macAddress
++		return formatMAC(b)
++	case 5: // networkAddress (first byte = address family per IANA)
++		if len(b) == 5 && b[0] == 1 { // IPv4
++			return fmt.Sprintf("%d.%d.%d.%d", b[1], b[2], b[3], b[4])
++		}
++		return hex.EncodeToString(b)
++	default:
++		if s, ok := printableString(b); ok {
++			return s
++		}
++		return hex.EncodeToString(b)
++	}
++}
++
++// decodeLLDPPortID renders a port id according to its subtype.
++func decodeLLDPPortID(subtype int64, b []byte) string {
++	if len(b) == 0 {
++		return ""
++	}
++	switch subtype {
++	case 3: // macAddress
++		return formatMAC(b)
++	default:
++		if s, ok := printableString(b); ok {
++			return s
++		}
++		return hex.EncodeToString(b)
++	}
++}
++
++func formatMAC(b []byte) string {
++	if len(b) != 6 {
++		return hex.EncodeToString(b)
++	}
++	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
++}
++
++// printableString returns the bytes as a UTF-8 string if every byte is a
++// printable ASCII character or common whitespace; otherwise ok=false.
++func printableString(b []byte) (string, bool) {
++	for _, c := range b {
++		if c < 0x20 || c > 0x7e {
++			return "", false
++		}
++	}
++	return string(b), true
++}
++
++// trimOIDSuffix strips a leading dot and the base OID from a PDU name,
++// returning the remaining index components split on ".". Returns nil if
++// the name doesn't belong to the table.
++func trimOIDSuffix(name, base string) []string {
++	trimmed := strings.TrimPrefix(name, ".")
++	if !strings.HasPrefix(trimmed, base) {
++		return nil
++	}
++	suffix := strings.TrimPrefix(trimmed[len(base):], ".")
++	if suffix == "" {
++		return nil
++	}
++	return strings.Split(suffix, ".")
+ }
+ 
+ // pollCDPNeighbors walks the cdpCacheTable and returns any discovered
+diff --git a/pkg/inputs/snmp/metadata/topology_test.go b/pkg/inputs/snmp/metadata/topology_test.go
+index 20de911..e881cf4 100644
+--- a/pkg/inputs/snmp/metadata/topology_test.go
++++ b/pkg/inputs/snmp/metadata/topology_test.go
+@@ -97,6 +97,196 @@ func TestParseCDPNeighbors_NilIfaces(t *testing.T) {
+ 	}
+ }
+ 
++// lldpLocPDU builds a synthetic lldpLocPortEntry PDU.
++func lldpLocPDU(col, portNum string, t gosnmp.Asn1BER, v interface{}) gosnmp.SnmpPDU {
++	return gosnmp.SnmpPDU{
++		Name:  "." + oidLLDPLocPortTable + "." + col + "." + portNum,
++		Type:  t,
++		Value: v,
++	}
++}
++
++// lldpRemPDU builds a synthetic lldpRemEntry PDU.
++func lldpRemPDU(col, timeMark, locPort, remIdx string, t gosnmp.Asn1BER, v interface{}) gosnmp.SnmpPDU {
++	return gosnmp.SnmpPDU{
++		Name:  "." + oidLLDPRemTable + "." + col + "." + timeMark + "." + locPort + "." + remIdx,
++		Type:  t,
++		Value: v,
++	}
++}
++
++func TestFormatMAC(t *testing.T) {
++	assert.Equal(t, "aa:bb:cc:dd:ee:ff", formatMAC([]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}))
++	// Non-6-byte input falls back to hex so nothing is silently dropped.
++	assert.Equal(t, "aabb", formatMAC([]byte{0xaa, 0xbb}))
++}
++
++func TestDecodeLLDPChassisID(t *testing.T) {
++	// Subtype 4 = macAddress
++	assert.Equal(t, "00:11:22:33:44:55",
++		decodeLLDPChassisID(4, []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}))
++	// Subtype 5 = networkAddress, IPv4 (family=1)
++	assert.Equal(t, "10.0.0.9",
++		decodeLLDPChassisID(5, []byte{0x01, 10, 0, 0, 9}))
++	// Subtype 7 = local, printable string passes through
++	assert.Equal(t, "switch-a",
++		decodeLLDPChassisID(7, []byte("switch-a")))
++	// Non-printable falls back to hex
++	assert.Equal(t, "0011",
++		decodeLLDPChassisID(7, []byte{0x00, 0x11}))
++}
++
++func TestParseLLDPLocPorts(t *testing.T) {
++	pdus := []gosnmp.SnmpPDU{
++		lldpLocPDU("2", "1", gosnmp.Integer, 5),                          // subtype=interfaceName
++		lldpLocPDU("3", "1", gosnmp.OctetString, []byte("Ethernet1/1")),  // id
++		lldpLocPDU("4", "1", gosnmp.OctetString, []byte("Ethernet1/1")),  // desc
++
++		lldpLocPDU("2", "2", gosnmp.Integer, 3),                          // subtype=macAddress
++		lldpLocPDU("3", "2", gosnmp.OctetString, []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}),
++		lldpLocPDU("4", "2", gosnmp.OctetString, []byte("Ethernet1/2")),
++	}
++	out := parseLLDPLocPorts(pdus, oidLLDPLocPortTable)
++	if assert.Contains(t, out, "1") {
++		assert.EqualValues(t, lldpSubtypeInterfaceName, out["1"].subtype)
++		assert.Equal(t, []byte("Ethernet1/1"), out["1"].id)
++		assert.Equal(t, "Ethernet1/1", out["1"].desc)
++	}
++	if assert.Contains(t, out, "2") {
++		assert.EqualValues(t, lldpSubtypeMacAddress, out["2"].subtype)
++		assert.Equal(t, "Ethernet1/2", out["2"].desc)
++	}
++}
++
++func TestParseLLDPNeighbors_InterfaceNameResolution(t *testing.T) {
++	// Two neighbors: one on local port 1 (mapped via interfaceName), one
++	// on local port 2 (mapped via macAddress).
++	ifaces := map[string]*kt.InterfaceData{
++		"101": {
++			Index:       "101",
++			Description: "Ethernet1/1",
++			ExtraInfo:   map[string]string{},
++		},
++		"102": {
++			Index:       "102",
++			Description: "Ethernet1/2",
++			ExtraInfo: map[string]string{
++				SNMP_ifPhysAddress: "aa:bb:cc:dd:ee:ff",
++			},
++		},
++	}
++	locPorts := map[string]*lldpLocPort{
++		"1": {
++			subtype: lldpSubtypeInterfaceName,
++			id:      []byte("Ethernet1/1"),
++			desc:    "Ethernet1/1",
++		},
++		"2": {
++			subtype: lldpSubtypeMacAddress,
++			id:      []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
++			desc:    "Ethernet1/2",
++		},
++	}
++	pdus := []gosnmp.SnmpPDU{
++		// local port 1, timeMark 5, rem index 1 — a neighbor switch
++		lldpRemPDU("4", "5", "1", "1", gosnmp.Integer, 4), // chassisSubtype = macAddress
++		lldpRemPDU("5", "5", "1", "1", gosnmp.OctetString, []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}),
++		lldpRemPDU("6", "5", "1", "1", gosnmp.Integer, 5), // portSubtype = interfaceName
++		lldpRemPDU("7", "5", "1", "1", gosnmp.OctetString, []byte("GigabitEthernet0/24")),
++		lldpRemPDU("8", "5", "1", "1", gosnmp.OctetString, []byte("uplink to core")),
++		lldpRemPDU("9", "5", "1", "1", gosnmp.OctetString, []byte("core-a.example.net")),
++		lldpRemPDU("10", "5", "1", "1", gosnmp.OctetString, []byte("Cisco IOS core-a")),
++		lldpRemPDU("12", "5", "1", "1", gosnmp.OctetString, []byte{0x00, 0x14}),
++
++		// local port 2, timeMark 5, rem index 1 — a server
++		lldpRemPDU("4", "5", "2", "1", gosnmp.Integer, 4),
++		lldpRemPDU("5", "5", "2", "1", gosnmp.OctetString, []byte{0xde, 0xad, 0xbe, 0xef, 0x00, 0x01}),
++		lldpRemPDU("6", "5", "2", "1", gosnmp.Integer, 3), // portSubtype = macAddress
++		lldpRemPDU("7", "5", "2", "1", gosnmp.OctetString, []byte{0xde, 0xad, 0xbe, 0xef, 0x00, 0x02}),
++		lldpRemPDU("9", "5", "2", "1", gosnmp.OctetString, []byte("server-1")),
++	}
++
++	got := parseLLDPNeighbors(pdus, oidLLDPRemTable, locPorts, ifaces)
++	if assert.Len(t, got, 2) {
++		n0 := got[0]
++		assert.Equal(t, kt.NeighborSourceLLDP, n0.Source)
++		assert.EqualValues(t, 101, n0.LocalIfIndex)
++		assert.Equal(t, "Ethernet1/1", n0.LocalIfName)
++		assert.Equal(t, "00:11:22:33:44:55", n0.RemoteChassisID)
++		assert.Equal(t, "core-a.example.net", n0.RemoteSysName)
++		assert.Equal(t, "Cisco IOS core-a", n0.RemoteSysDesc)
++		assert.Equal(t, "GigabitEthernet0/24", n0.RemotePortID)
++		assert.Equal(t, "uplink to core", n0.RemotePortDesc)
++		assert.Equal(t, "0x0014", n0.RemoteCapabilities)
++
++		n1 := got[1]
++		assert.EqualValues(t, 102, n1.LocalIfIndex)
++		assert.Equal(t, "Ethernet1/2", n1.LocalIfName)
++		assert.Equal(t, "deadbeef:0001", "deadbeef:0001") // sanity
++		assert.Equal(t, "de:ad:be:ef:00:01", n1.RemoteChassisID)
++		assert.Equal(t, "de:ad:be:ef:00:02", n1.RemotePortID, "mac port id should be formatted")
++		assert.Equal(t, "server-1", n1.RemoteSysName)
++	}
++}
++
++func TestParseLLDPNeighbors_DescFallback(t *testing.T) {
++	// locPort subtype 7 (local) — resolve via desc match against ifDescr.
++	ifaces := map[string]*kt.InterfaceData{
++		"7": {Index: "7", Description: "Fa0/7", ExtraInfo: map[string]string{}},
++	}
++	locPorts := map[string]*lldpLocPort{
++		"7": {subtype: lldpSubtypeLocal, id: []byte("7"), desc: "Fa0/7"},
++	}
++	pdus := []gosnmp.SnmpPDU{
++		lldpRemPDU("4", "1", "7", "1", gosnmp.Integer, 4),
++		lldpRemPDU("5", "1", "7", "1", gosnmp.OctetString, []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}),
++		lldpRemPDU("9", "1", "7", "1", gosnmp.OctetString, []byte("neighbor")),
++	}
++	got := parseLLDPNeighbors(pdus, oidLLDPRemTable, locPorts, ifaces)
++	if assert.Len(t, got, 1) {
++		assert.EqualValues(t, 7, got[0].LocalIfIndex)
++		assert.Equal(t, "Fa0/7", got[0].LocalIfName)
++	}
++}
++
++func TestMergeNeighbors_LLDPAndCDP(t *testing.T) {
++	// Same local ifIndex and remote sysName seen via LLDP and CDP should
++	// collapse into a single record with Source=lldp+cdp.
++	in := []kt.TopologyNeighbor{
++		{
++			Source:          kt.NeighborSourceLLDP,
++			LocalIfIndex:    3,
++			LocalIfName:     "Eth1/3",
++			RemoteSysName:   "peer-a",
++			RemoteChassisID: "00:11:22:33:44:55",
++			RemotePortID:    "Eth1/1",
++		},
++		{
++			Source:         kt.NeighborSourceCDP,
++			LocalIfIndex:   3,
++			LocalIfName:    "Eth1/3",
++			RemoteSysName:  "peer-a",
++			RemotePortID:   "Eth1/1",
++			RemotePlatform: "cisco N9K",
++		},
++	}
++	out := mergeNeighbors(in)
++	if assert.Len(t, out, 1) {
++		assert.Equal(t, kt.NeighborSourceBoth, out[0].Source)
++		assert.Equal(t, "00:11:22:33:44:55", out[0].RemoteChassisID)
++		assert.Equal(t, "cisco N9K", out[0].RemotePlatform)
++	}
++}
++
++func TestMergeNeighbors_DistinctNeighborsStay(t *testing.T) {
++	in := []kt.TopologyNeighbor{
++		{Source: kt.NeighborSourceLLDP, LocalIfIndex: 1, RemoteSysName: "a"},
++		{Source: kt.NeighborSourceLLDP, LocalIfIndex: 2, RemoteSysName: "b"},
++	}
++	out := mergeNeighbors(in)
++	assert.Len(t, out, 2, "same protocol on different ports should not be merged")
++}
++
+ func TestSelectedNeighborProtocols(t *testing.T) {
+ 	both := selectedNeighborProtocols(&kt.SnmpDeviceConfig{})
+ 	assert.True(t, both[neighborProtocolLLDP])
+-- 
+2.43.0
+

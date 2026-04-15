@@ -1,0 +1,99 @@
+version: "3.9"
+services:
+  influxdb:
+    image: influxdb:2.2.0-alpine
+    restart: always
+    environment:
+      - "DOCKER_INFLUXDB_INIT_MODE=setup"
+      - "DOCKER_INFLUXDB_INIT_USERNAME=admin"
+      - "DOCKER_INFLUXDB_INIT_PASSWORD=influxdb"
+      - "DOCKER_INFLUXDB_INIT_ORG=system"
+      - "DOCKER_INFLUXDB_INIT_BUCKET=default"
+      - "DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=secret-token"
+    healthcheck:
+      test: ["CMD", "curl", "localhost:8086"]
+      interval: 10s
+      timeout: 1s
+      retries: 30
+      start_period: 10s
+    ports:
+      - 8086:8086
+
+  ktranslate:
+    image: kentik/ktranslate:latest
+    entrypoint:
+      - sh
+      - -euc
+      - |
+        cat <<EOF > /tmp/ktranslate.toml
+        listenaddr: "127.0.0.1:8081"
+        udrsfile: "/etc/ktranslate/udr.csv"
+        geofile: "/etc/ktranslate/GeoLite2-Country.mmdb"
+        asnfile: "/etc/ktranslate/GeoLite2-ASN.mmdb"
+        processingthreads: 1
+        inputthreads: 1
+        maxthreads: 1
+        format: "influx"
+        compression: "none"
+        sinks: ["stdout"]
+        maxflowspermessage: 10000
+        rollupinterval: 0
+        rollupandalpha: false
+        samplerate: 1
+        samplemin: 1
+        enablesnmpdiscovery: false
+        kentikplan: 0
+        apibaseurl: "https://api.kentik.com"
+        enableteelogs: false
+        enablehttpinput: true
+        filters: []
+
+        netflowformat:
+          version: "netflow5"
+
+        httpsink:
+          target: "http://influxdb:8086/api/v2/write?org=system&bucket=default"
+          headers: ["Authorization:Token secret-token", "Content-Type:application/json"]
+          insecureskipverify: false
+          timeoutinseconds: 30
+
+        server:
+          servicename: "ktranslate"
+          loglevel: "info"
+          logtostdout: false
+          metricsendpoint: "none"
+          metalistenaddr: ""
+          ollydataset: ""
+          ollywritekey: ""
+
+        api:
+          devicefile: "/etc/ktranslate/devices.json"
+
+        flowinput:
+          enable: true
+          protocol: "netflow5"
+          listenip: "0.0.0.0"
+          listenport: 9995
+          enablereuseport: false
+          workers: 1
+          messagefields: "TimeReceived,SamplingRate,Bytes,Packets,SrcAddr,DstAddr,Proto,SrcPort,DstPort,InIf,OutIf,SrcVlan,DstVlan,TCPFlags,SrcAS,DstAS,Type,SamplerAddress"
+          prometheuslistenaddr: ""
+          mappingfile: ""
+        EOF
+        ktranslate --config /tmp/ktranslate.toml
+    restart: always
+    ports:
+      - 9995:9995/udp
+    depends_on:
+      - influxdb
+
+  nflow:
+    image: ehazlett/nflow-generator:latest
+    restart: always
+    command:
+      - -t
+      - ktranslate
+      - -p
+      - "9995"
+    depends_on:
+      - ktranslate

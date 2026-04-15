@@ -1,0 +1,32 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+bin/*
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+## This is downloaded at build time
+config/GeoLite2-Country.mmdb
+config/GeoLite2-ASN.mmdb
+config/profiles
+
+#generated on build
+cmd/version/generated_version.go
+
+.vscode/
+.idea/
+
+## local configuration
+config.yaml
+
+.DS_Store
